@@ -49,6 +49,7 @@ dependencies:
     git:
       url: https://github.com/begaz/OBDII.git
       ref: main
+  no_screenshot: ^0.3.1
 
 
 dev_dependencies:

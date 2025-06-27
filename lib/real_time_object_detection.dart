@@ -41,12 +41,23 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
   String _errorMessage = '';
   List<String> _speedingWarnings = [];
   late OBDService _obdService;
+  // Speed monitoring
+  List<double> _speedHistory = []; // For smoothing
+  static const int _speedHistoryWindow = 3; // Number of samples for smoothing
+  DateTime? _lastSpeedWarningTime; // Debounce speed warnings
+  static const Duration _speedWarningDebounce = Duration(seconds: 2); // Debounce interval
+  // Warning positioning
+  int _activeWarningCount = 0; // Track number of active warnings
+  static const double _warningVerticalSpacing = 60.0; // Vertical offset between warnings
+  // Collision warning management
 
   // Settings for overlays
-  bool _showCamera = true;
-  bool _showDetections = true;
+  bool _showCamera = false;
+  bool _showDetections = false;
   bool _showOBDData = true;
-
+  // Location tracking for API
+  LatLng? _startLocation; // Store start location
+  LatLng? _endLocation; // Store end location
   bool _showConnectionStatus = false;
   bool _showSpeedWarnings = true;
   bool _showMap = true;
@@ -76,7 +87,6 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
   static const double _maxSpeedThreshold = 300.0;
   static const int _speedSmoothingWindow = 1; // Reduced for less delay
   List<double> _gpsSpeedHistory = [];
-  static const Duration _gpsTimeout = Duration(seconds:1);
   DateTime? _lastValidGPSTime;
   static const Duration _gpsValidityTimeout = Duration(seconds: 10);
   // Error popup debouncing
@@ -104,7 +114,10 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
   Timer? _gpsSpeedUpdateTimer;
   Timer? _obdStatusCheckTimer;
 
-
+// Safe driving tracking
+  static const Duration _safeDrivingLogInterval = Duration(seconds: 30); // Log safe driving every 30 seconds
+  bool _hasAdverseEvent = false;
+  Timer? _safeDrivingTimer;
   @override
   void initState() {
     super.initState();
@@ -116,13 +129,13 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
     _initializeGPS();
     _setupOrientationListener();
     _startGPSSpeedUpdates();
+    _startSafeDrivingCheck();
     _startOBDStatusCheck();
     _enableSpeedSmoothing = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final args = ModalRoute.of(context)!.settings.arguments;
       if (args is Map<String, dynamic> && args.containsKey('userId')) {
         _userId = args["userId"].toString();
-        print('User ID: $_userId');
       } else {
         _showErrorPopup('Invalid user ID provided', isOBDError: false);
         _setDefaultUserDetails();
@@ -133,12 +146,19 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
 
   void _startOBDStatusCheck() {
     _obdStatusCheckTimer = Timer.periodic(Duration(seconds: 5), (timer) {
-      print('OBD Status Check: ${_obdService.bluetoothStatus}, Speed: $_obdSpeed');
       if (_obdService.bluetoothStatus == 'Failed' && mounted) {
         _showErrorPopup('OBD connection failed', isOBDError: true);
       }
     });
+  }void _startSafeDrivingCheck() {
+    _safeDrivingTimer = Timer.periodic(_safeDrivingLogInterval, (timer) {
+      if (!_hasAdverseEvent && mounted) {
+        _logEvent('safe_driving', 'No adverse events detected for ${_safeDrivingLogInterval.inSeconds} seconds', _lastPosition);
+      }
+      _hasAdverseEvent = false; // Reset after each check
+    });
   }
+
 
   void _setupOrientationListener() {
     SystemChrome.setPreferredOrientations([
@@ -164,7 +184,6 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       _individualOverlayPositions['Connection'] = Offset(baseLeft, baseTop + 3 * spacing);
     });
   }
-
   Future<void> _initializeGPS() async {
     try {
       LocationPermission permission = await Geolocator.checkPermission();
@@ -179,37 +198,27 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       if (permission == LocationPermission.whileInUse || permission == LocationPermission.always) {
         const LocationSettings locationSettings = LocationSettings(
           accuracy: LocationAccuracy.bestForNavigation,
-           // Update every 1 meter of movement
-          // Timeout for getting location
         );
 
         _positionStreamSubscription = Geolocator.getPositionStream(
           locationSettings: locationSettings,
-        ).listen(
-              (Position position) {
-            print('GPS Update: Lat: ${position.latitude}, Lng: ${position.longitude}, Accuracy: ${position.accuracy}m, Speed: ${position.speed}m/s');
+        ).listen((Position position) {
 
-            // Update distance tracking immediately when new position arrives
-            _updateDistanceTracking(position);
+          _updateDistanceTracking(position);
 
-            // Update position and timing for speed calculations
-            _lastPosition = position;
-            _lastPositionTime = DateTime.now();
-            _lastValidGPSTime = DateTime.now();
-          },
-          onError: (e) {
-            print('GPS stream error: $e');
-            if (mounted) {
-              setState(() {
-                _gpsSpeed = 0.0;
-              });
-              _showErrorPopup('GPS error: $e', isOBDError: false);
-            }
-          },
-        );
+          _lastPosition = position;
+          _lastPositionTime = DateTime.now();
+          _lastValidGPSTime = DateTime.now();
+        }, onError: (e) {
+          if (mounted) {
+            setState(() {
+              _gpsSpeed = 0.0;
+            });
+            _showErrorPopup('GPS error: $e', isOBDError: false);
+          }
+        });
       }
     } catch (e) {
-      print('GPS initialization error: $e');
       if (mounted) {
         _showErrorPopup('Failed to initialize GPS: $e', isOBDError: false);
       }
@@ -231,15 +240,16 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
               _gpsSpeed = 0.0;
             });
           }
-          print('GPS data timeout - setting speed to 0');
         }
       }
     });
   }
-
-// Separate method for updating distance tracking
   void _updateDistanceTracking(Position position) {
     LatLng currentPoint = LatLng(position.latitude, position.longitude);
+
+    if (_lastPosition == null) {
+      _startLocation = currentPoint; // Set start location on first GPS update
+    }
 
     if (_lastPosition != null) {
       double distance = Geolocator.distanceBetween(
@@ -247,46 +257,72 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
         _lastPosition!.longitude,
         position.latitude,
         position.longitude,
-      ) / 1000; // Convert meters to kilometers
+      ) / 1000;
 
-      // Validate distance jump to filter out GPS errors
-      if (_isValidDistanceJump(distance) && distance >= 0.001) { // Filter distances < 1 meter
-        print('Distance traveled: ${distance} km');
-
+      if (_isValidDistanceJump(distance) && distance >= 0.001) {
         if (mounted) {
           setState(() {
             _totalDistanceTraveled += distance;
           });
         }
-
-        // Add point to traveled path
         _traveledPath.add(currentPoint);
       } else if (distance > 1.0) {
-        print('Invalid distance jump detected: ${distance} km - GPS error likely');
-        // Still add the point to path but don't update distance
         _traveledPath.add(currentPoint);
       } else {
-        // Distance too small, but still add point for path continuity
         _traveledPath.add(currentPoint);
       }
     } else {
-      // First position - just add to path
       _traveledPath.add(currentPoint);
-      print('First GPS position recorded');
+    }
+
+    _endLocation = currentPoint; // Update end location with latest position
+    _lastPosition = position;
+    _lastPositionTime = DateTime.now();
+  }
+  Future<void> _sendLocationData() async {
+    if (_traveledPath.isEmpty || _startLocation == null || _endLocation == null) {
+      return;
+    }
+
+    try {
+      final response = await http.post(
+        Uri.parse('https://adas-backend.onrender.com/api/location'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'user_id': _userId,
+          'start_location': {
+            'latitude': _startLocation!.latitude,
+            'longitude': _startLocation!.longitude,
+          },
+          'end_location': {
+            'latitude': _endLocation!.latitude,
+            'longitude': _endLocation!.longitude,
+          },
+          'traveled_path': _traveledPath
+              .map((point) => {
+            'latitude': point.latitude,
+            'longitude': point.longitude,
+          })
+              .toList(),
+          'timestamp': DateTime.now().toIso8601String(),
+          'total_distance': _totalDistanceTraveled,
+        }),
+      );
+
+      if (response.statusCode != 200) {
+      }
+    } catch (e) {
+      print('Error sending location data: $e');
     }
   }
-
-// Simplified speed calculation method - only handles speed
   void _calculateGPSSpeed(Position position) {
     double speedInMPS = position.speed;
-    print('Raw GPS speed: $speedInMPS m/s');
 
     if (speedInMPS < 0) {
       speedInMPS = 0.0;
     }
 
     double speedInKMH = speedInMPS * 3.6;
-    print('Speed in KMH: $speedInKMH');
 
     if (speedInKMH < _minSpeedThreshold) {
       speedInKMH = 0.0;
@@ -296,7 +332,6 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       speedInKMH = _maxSpeedThreshold;
     }
 
-    // Apply speed smoothing if enabled
     if (_enableSpeedSmoothing) {
       _gpsSpeedHistory.add(speedInKMH);
       if (_gpsSpeedHistory.length > _speedSmoothingWindow) {
@@ -311,7 +346,7 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       });
 
       if (_selectedSpeedSource == 'GPS') {
-        _checkForSuddenSpeedChanges(_gpsSpeed, 'GPS');
+        _checkForSuddenSpeedChanges(_gpsSpeed, 'GPS', position);
       }
     }
   }
@@ -339,7 +374,6 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
         double impliedSpeed = (distanceKM / timeDifferenceSeconds) * 3600;
         // Reject if implied speed is unrealistic (> 300 km/h)
         if (impliedSpeed > 300) {
-          print('Unrealistic implied speed: $impliedSpeed km/h');
           return false;
         }
       }
@@ -347,37 +381,46 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
 
     return true;
   }
-
-
-  void _checkForSuddenSpeedChanges(double currentSpeed, String source) {
+  void _checkForSuddenSpeedChanges(double currentSpeed, String source, Position position) {
     DateTime now = DateTime.now();
 
     if (_lastSpeedUpdate != null &&
-        now.difference(_lastSpeedUpdate!).inMilliseconds >= _speedCheckInterval.inMilliseconds) {
+        now.difference(_lastSpeedUpdate!).inMilliseconds >= _speedCheckInterval.inMilliseconds &&
+        (_lastSpeedWarningTime == null ||
+            now.difference(_lastSpeedWarningTime!).inSeconds >= _speedWarningDebounce.inSeconds)) {
       double speedDifference = currentSpeed - _previousSpeed;
+      double dynamicThreshold = currentSpeed > 100 ? _suddenSpeedThreshold * 1.2 : _suddenSpeedThreshold;
 
-      double dynamicThreshold = currentSpeed > 100 ? _suddenSpeedThreshold * 1.5 : _suddenSpeedThreshold;
+      _speedHistory.add(currentSpeed);
+      if (_speedHistory.length > _speedHistoryWindow) {
+        _speedHistory.removeAt(0);
+      }
+      double smoothedSpeed = _speedHistory.reduce((a, b) => a + b) / _speedHistory.length;
 
       if (speedDifference > dynamicThreshold && _showSpeedWarnings) {
         String description = 'Sudden speed increase detected: ${speedDifference.toStringAsFixed(1)} km/h via $source';
         _showSpeedWarning(description, Colors.orange);
-        _logEvent('sudden_acceleration', description);
+        _logEvent('sudden_acceleration', description, position);
+        _hasAdverseEvent = true;
+        _lastSpeedWarningTime = now;
       } else if (speedDifference < -dynamicThreshold && _showSpeedWarnings) {
         String description = 'Sudden braking detected: ${speedDifference.abs().toStringAsFixed(1)} km/h via $source';
         _showSpeedWarning(description, Colors.red);
-        _logEvent('sudden_braking', description);
+        _logEvent('sudden_braking', description, position);
+        _hasAdverseEvent = true;
+        _lastSpeedWarningTime = now;
       }
 
-      _previousSpeed = currentSpeed;
+      _previousSpeed = smoothedSpeed;
       _lastSpeedUpdate = now;
     } else if (_lastSpeedUpdate == null) {
       _previousSpeed = currentSpeed;
       _lastSpeedUpdate = now;
     }
   }
-
   void _showSpeedWarning(String message, Color color) {
     if (mounted) {
+      final warningIndex = _activeWarningCount++;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Row(
@@ -388,17 +431,35 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
             ],
           ),
           backgroundColor: color,
-          duration: const Duration(seconds: 4),
+          duration: const Duration(seconds: 3),
           behavior: SnackBarBehavior.floating,
           margin: EdgeInsets.only(
-            bottom: _isLandscape ? 20 : MediaQuery.of(context).size.height - 150,
+            bottom: _isLandscape
+                ? 20 + (warningIndex * _warningVerticalSpacing)
+                : MediaQuery.of(context).size.height - 150 - (warningIndex * _warningVerticalSpacing),
             left: 20,
             right: 20,
           ),
+          onVisible: () {
+            // Optional: Handle visibility if needed
+          },
+          action: SnackBarAction(
+            label: 'Dismiss',
+            onPressed: () {
+              _activeWarningCount = (_activeWarningCount - 1).clamp(0, double.infinity).toInt();
+            },
+          ),
         ),
-      );
+      ).closed.then((_) {
+        if (mounted) {
+          setState(() {
+            _activeWarningCount = (_activeWarningCount - 1).clamp(0, double.infinity).toInt();
+          });
+        }
+      });
     }
-  }void _showMapDialog() {
+  }
+  void _showMapDialog() {
     if (_traveledPath.isEmpty || _lastPosition == null) {
       _showErrorPopup('No GPS data available for map', isOBDError: false);
       return;
@@ -491,26 +552,31 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       },
     );
   }
-
   void _setupOBDCallbacks() {
     _obdService.onStatusChanged = (status) {
-      print('OBD Status Changed: $status');
       if (mounted && status == 'Failed') {
         _showErrorPopup('OBD Connection Failed', isOBDError: true);
       }
     };
-    _obdService.onError = (error) {
-      if (mounted) {
-        _showErrorPopup('OBD Error: $error', isOBDError: true);
-      }
-    };
+
     _obdService.onSpeedChanged = (speed) {
       if (mounted && (_obdSpeed - speed).abs() > 0.1) {
         setState(() {
           _obdSpeed = speed;
         });
         if (_selectedSpeedSource == 'OBD') {
-          _checkForSuddenSpeedChanges(_obdSpeed, 'OBD');
+          _checkForSuddenSpeedChanges(_obdSpeed, 'OBD', _lastPosition ?? Position(
+            latitude: 0.0,
+            longitude: 0.0,
+            timestamp: DateTime.now(),
+            accuracy: 0.0,
+            altitude: 0.0,
+            heading: 0.0,
+            speed: 0.0,
+            speedAccuracy: 0.0,
+            altitudeAccuracy: 0.0,
+            headingAccuracy: 0.0,
+          ));
         }
       }
     };
@@ -869,6 +935,9 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
     _modelDebounceTimer?.cancel();
     _gpsSpeedUpdateTimer?.cancel();
     _obdStatusCheckTimer?.cancel();
+    _safeDrivingTimer?.cancel();
+
+    _sendLocationData();
     WakelockPlus.disable();
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     if (_controller != null) {
@@ -943,8 +1012,6 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       final response = await http.get(
         Uri.parse('https://adas-backend.onrender.com/api/get_users'),
       );
-      print('Fetch user details response: ${response.body}');
-      print('Status code: ${response.statusCode}');
 
       if (response.statusCode == 200) {
         try {
@@ -1030,35 +1097,17 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
     });
   }
 
+
   double calculateDistance(double pixelWidth) {
     return (_knownWidth * _focalLength) / pixelWidth;
   }
 
   Future<void> runModel(CameraImage image) async {
-    if (_isProcessing || image.planes.isEmpty || !_showDetections) {
-      return;
-    }
+    if (_isProcessing || image.planes.isEmpty) return;
 
     setState(() {
       _isProcessing = true;
     });
-
-    // Define critical classes for collision warnings
-    const List<String> criticalClasses = [
-      'person',
-      'bicycle',
-      'car',
-      'motorcycle',
-      'bus',
-      'train',
-      'truck',
-      'bird',
-      'cat',
-      'dog',
-      'horse',
-      'sheep',
-      'cow'
-    ];
 
     try {
       var recognitions = await Tflite.detectObjectOnFrame(
@@ -1072,89 +1121,46 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
         threshold: 0.4,
       );
 
+      print('Recognitions: $recognitions');
+
       if (recognitions != null) {
         recognitions = recognitions.where((rec) {
-          if (rec['rect'] == null || rec['detectedClass'] == null || rec['confidenceInClass'] == null) {
+          if (rec['rect'] == null ||
+              rec['detectedClass'] == null ||
+              rec['confidenceInClass'] == null) {
+            print('Invalid recognition: Missing required fields - $rec');
             return false;
           }
           String detectedClass = rec['detectedClass'].toString();
           if (!_labels.contains(detectedClass)) {
+            print('Invalid class label: $detectedClass');
             return false;
           }
           return true;
         }).toList();
 
-        _speedingWarnings.clear();
         for (var rec in recognitions) {
           String detectedClass = rec['detectedClass'].toString();
-          // Calculate distance
-          double boxWidth = rec['rect']['w'] * image.width;
-          double distance = calculateDistance(boxWidth);
-          String distanceText = distance < 1
-              ? "${(distance * 100).toStringAsFixed(2)} cm"
-              : "${distance.toStringAsFixed(2)} m";
-
-          // Handle collision warning for critical classes
-          if (distance < 1.5 && criticalClasses.contains(detectedClass)) {
-            String warningMessage = "Collision Warning: Object $detectedClass at $distanceText";
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              ScaffoldMessenger.of(context).clearSnackBars(); // Reset existing SnackBar
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Row(
-                    children: [
-                      Icon(Icons.warning, color: Colors.white, size: 20),
-                      SizedBox(width: 8),
-                      Expanded(child: Text(warningMessage)),
-                    ],
-                  ),
-                  backgroundColor: Colors.red,
-                  duration: Duration(seconds: 4),
-                  behavior: SnackBarBehavior.floating,
-                  margin: EdgeInsets.all(8.0),
-                ),
-              );
-            });
-            _logEvent('collision_warning', warningMessage);
-          }
-
-          // Handle speed limit detections
           if (detectedClass.contains('speed_limit')) {
             double detectedSpeed = double.tryParse(detectedClass.replaceAll('speed_limit_', '')) ?? 0;
-            double currentSpeed = _selectedSpeedSource == 'OBD' ? _obdSpeed : _gpsSpeed;
-            String speedSource = _selectedSpeedSource;
-
-            if (currentSpeed > detectedSpeed && _showSpeedWarnings) {
-              String description =
-                  'Speed limit ${detectedSpeed.toInt()} km/h detected - Current speed: ${currentSpeed.toInt()} km/h ($speedSource) at $distanceText. Please slow down!';
-              _speedingWarnings.add(description);
-              _showSpeedWarning(description, Colors.red);
-              _logEvent('speed_limit_violation', description);
-            } else if (detectedSpeed > 0) {
-              String description =
-                  'Speed limit ${detectedSpeed.toInt()} km/h detected - Current speed: ${currentSpeed.toInt()} km/h ($speedSource) at $distanceText';
+            if (_obdSpeed > detectedSpeed) {
+              String description = 'Speeding detected: Car speed $_obdSpeed km/h, Limit $detectedSpeed km/h';
               _logEvent('speed_limit_detected', description);
+
             }
-          } else {
-            // Log non-speed-limit objects
-            String description = "Object $detectedClass detected at $distanceText";
-            _logEvent('object_detected', description);
           }
         }
       }
 
       if (mounted) {
         setState(() {
-          this.recognitions = recognitions ?? [];
+          this.recognitions = recognitions;
           imageHeight = image.height;
           imageWidth = image.width;
         });
       }
     } catch (e) {
       print('Error running model: $e');
-      if (mounted) {
-        _showErrorPopup('Model processing error: $e', isOBDError: false);
-      }
     } finally {
       if (mounted) {
         setState(() {
@@ -1163,8 +1169,7 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       }
     }
   }
-
-  Future<void> _logEvent(String eventType, String description) async {
+  Future<void> _logEvent(String eventType, String description, [Position? position]) async {
     try {
       final response = await http.post(
         Uri.parse('https://adas-backend.onrender.com/api/log_event'),
@@ -1176,9 +1181,10 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
           'timestamp': DateTime.now().toIso8601String(),
           'speed_obd': _obdSpeed,
           'speed_gps': _gpsSpeed,
+          'latitude': position?.latitude ?? 0.0,
+          'longitude': position?.longitude ?? 0.0,
         }),
       );
-      print('Log event response: ${response.body}');
     } catch (e) {
       print('Failed to log event: $e');
     }
@@ -1432,6 +1438,9 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       ],
     );
   }
+// Add this to the parent widget's state class
+// Add this to the parent widget's state class
+  List<DateTime> _collisionLogTimestamps = [];
 
   Widget _buildCameraFrame(BuildContext context) {
     if (_controller == null || !_controller!.value.isInitialized || _controller!.value.previewSize == null) {
@@ -1459,9 +1468,45 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
               setState(() {
                 _lastOrientation = currentOrientation;
               });
-
             }
           });
+        }
+
+        // Detect and log collision warnings for up to 3 different objects per minute
+        if (_showDetections && recognitions != null && recognitions!.isNotEmpty) {
+          final now = DateTime.now();
+          // Clean up timestamps older than 60 seconds
+          _collisionLogTimestamps.removeWhere((t) => now.difference(t).inSeconds > 60);
+
+          // Only log if fewer than 3 events in the last 60 seconds
+          if (_collisionLogTimestamps.length < 3) {
+            // Track logged objects in this frame to ensure uniqueness
+            Set<String> loggedObjects = {};
+
+            for (var rec in recognitions!) {
+              double w = rec["rect"]["w"] * constraints.maxWidth;
+              double distance = calculateDistance(w);
+              if (distance <= 1.5) {
+                // Generate a unique key for the object (coarser rounding for stability)
+                double centerX = (rec["rect"]["x"] + rec["rect"]["w"] / 2) * constraints.maxWidth;
+                double centerY = (rec["rect"]["y"] + rec["rect"]["h"] / 2) * constraints.maxHeight;
+                String objectKey = '${rec["detectedClass"]}_${(centerX / 10).round() * 10}_${(centerY / 10).round() * 10}';
+
+                // Log only if this object hasn't been logged in this frame and limit not reached
+                if (!loggedObjects.contains(objectKey) && _collisionLogTimestamps.length < 3) {
+                  _logEvent(
+                    'collision_warning',
+                    'Object ${rec["detectedClass"]} detected within 1.5 meters',
+                    _lastPosition,
+                  );
+                  _collisionLogTimestamps.add(now);
+                  loggedObjects.add(objectKey);
+                  // Limit to one log per frame to prevent bursts
+                  break;
+                }
+              }
+            }
+          }
         }
 
         return Stack(
@@ -1476,7 +1521,6 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
                 color: Colors.black,
                 child: Center(
                   child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       Icon(Icons.videocam_off, color: Colors.white, size: 50),
                       SizedBox(height: 16),
@@ -1501,7 +1545,7 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
                 screenH: constraints.maxHeight,
                 screenW: constraints.maxWidth,
                 calculateDistance: calculateDistance,
-                logEvent: _logEvent,
+                logEvent: (eventType, description) => _logEvent(eventType, description, _lastPosition),
               ),
             _buildLiveDataOverlay(constraints),
             _buildIndividualOverlays(constraints),
@@ -1524,7 +1568,6 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
                   onPressed: _showMapDialog,
                 ),
               ),
-
           ],
         );
       },
