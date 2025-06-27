@@ -92,7 +92,10 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
   // Error popup debouncing
   DateTime? _lastErrorPopupTime;
   static const Duration _errorPopupDebounce = Duration(seconds: 10);
-
+  // Speed data storage for backend
+  List<Map<String, dynamic>> _speedDataBuffer = [];
+  Timer? _speedDataSendTimer;
+  static const Duration _speedDataSendInterval = Duration(seconds: 30);
   // Orientation handling
   bool _isLandscape = false;
   Orientation? _lastOrientation;
@@ -130,6 +133,7 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
     _setupOrientationListener();
     _startGPSSpeedUpdates();
     _startSafeDrivingCheck();
+    _startSpeedDataSending();
     _startOBDStatusCheck();
     _enableSpeedSmoothing = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -183,6 +187,44 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       _individualOverlayPositions['Throttle'] = Offset(baseLeft, baseTop + 2 * spacing);
       _individualOverlayPositions['Connection'] = Offset(baseLeft, baseTop + 3 * spacing);
     });
+  }
+  void _startSpeedDataSending() {
+    _speedDataSendTimer = Timer.periodic(_speedDataSendInterval, (timer) {
+      if (_speedDataBuffer.isNotEmpty) {
+        _sendSpeedData();
+      }
+    });
+  }
+  Future<void> _sendSpeedData() async {
+    if (_speedDataBuffer.isEmpty || _userId.isEmpty) return;
+
+    try {
+      final response = await http.post(
+        Uri.parse('https://adas-backend.onrender.com/api/speed'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'user_id': _userId,
+          'speed_data': _speedDataBuffer,
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data['success']) {
+          if (mounted) {
+            setState(() {
+              _speedDataBuffer.clear(); // Clear buffer after successful send
+            });
+          }
+        } else {
+          print('Failed to send speed data: ${data['error']}');
+        }
+      } else {
+        print('Server error sending speed data: ${response.statusCode}');
+      }
+    } catch (e) {
+      print('Error sending speed data: $e');
+    }
   }
   Future<void> _initializeGPS() async {
     try {
@@ -345,12 +387,22 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
         _gpsSpeed = speedInKMH;
       });
 
+      // Store speed data in buffer
+      if (_lastPosition != null) {
+        _speedDataBuffer.add({
+          'latitude': _lastPosition!.latitude,
+          'longitude': _lastPosition!.longitude,
+          'speed': speedInKMH,
+          'speed_source': 'GPS',
+          'timestamp': DateTime.now().toIso8601String(),
+        });
+      }
+
       if (_selectedSpeedSource == 'GPS') {
         _checkForSuddenSpeedChanges(_gpsSpeed, 'GPS', position);
       }
     }
   }
-
   void _toggleSpeedSmoothing(bool enable) {
     _enableSpeedSmoothing = enable;
     if (!enable) {
@@ -564,6 +616,15 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
         setState(() {
           _obdSpeed = speed;
         });
+        if (_lastPosition != null) {
+          _speedDataBuffer.add({
+            'latitude': _lastPosition!.latitude,
+            'longitude': _lastPosition!.longitude,
+            'speed': speed,
+            'speed_source': 'OBD',
+            'timestamp': DateTime.now().toIso8601String(),
+          });
+        }
         if (_selectedSpeedSource == 'OBD') {
           _checkForSuddenSpeedChanges(_obdSpeed, 'OBD', _lastPosition ?? Position(
             latitude: 0.0,
@@ -936,7 +997,11 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
     _gpsSpeedUpdateTimer?.cancel();
     _obdStatusCheckTimer?.cancel();
     _safeDrivingTimer?.cancel();
+    _speedDataSendTimer?.cancel();
 
+
+    // Send any remaining speed data before disposing
+    _sendSpeedData();
     _sendLocationData();
     WakelockPlus.disable();
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
