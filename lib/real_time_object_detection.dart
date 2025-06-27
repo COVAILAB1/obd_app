@@ -94,8 +94,9 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
   static const Duration _errorPopupDebounce = Duration(seconds: 10);
   // Speed data storage for backend
   List<Map<String, dynamic>> _speedDataBuffer = [];
+  static const int _maxBufferSize = 50;
+  static const Duration _speedDataSendInterval = Duration(seconds: 10); // Reduced to 10 seconds
   Timer? _speedDataSendTimer;
-  static const Duration _speedDataSendInterval = Duration(seconds: 30);
   // Orientation handling
   bool _isLandscape = false;
   Orientation? _lastOrientation;
@@ -198,14 +199,37 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
   Future<void> _sendSpeedData() async {
     if (_speedDataBuffer.isEmpty || _userId.isEmpty) return;
 
+    // Filter out invalid entries
+    final validSpeedData = _speedDataBuffer.where((data) =>
+    data['latitude'] != null &&
+        data['longitude'] != null &&
+        data['speed'] != null &&
+        data['speed_obd'] != null &&
+        data['speed_gps'] != null &&
+        data['speed_source'] != null &&
+        data['timestamp'] != null).toList();
+
+    if (validSpeedData.isEmpty) {
+      print('No valid speed data to send');
+      if (mounted) {
+        setState(() {
+          _speedDataBuffer.clear(); // Clear buffer to prevent accumulation
+        });
+      }
+      return;
+    }
+
     try {
+      final payload = jsonEncode({
+        'user_id': _userId,
+        'speed_data': validSpeedData,
+      });
+      print('Sending speed data payload: ${payload.length} bytes');
+
       final response = await http.post(
         Uri.parse('https://adas-backend.onrender.com/api/speed'),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'user_id': _userId,
-          'speed_data': _speedDataBuffer,
-        }),
+        body: payload,
       );
 
       if (response.statusCode == 200) {
@@ -216,16 +240,29 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
               _speedDataBuffer.clear(); // Clear buffer after successful send
             });
           }
+          print('Speed data sent successfully: ${data['speed_ids']}');
         } else {
           print('Failed to send speed data: ${data['error']}');
         }
       } else {
         print('Server error sending speed data: ${response.statusCode}');
+        if (response.statusCode == 413 && mounted) { // Payload too large
+          setState(() {
+            _speedDataBuffer.clear(); // Clear buffer to prevent accumulation
+          });
+          print('Payload too large, buffer cleared');
+        }
       }
     } catch (e) {
       print('Error sending speed data: $e');
+      if (mounted) {
+        setState(() {
+          _speedDataBuffer.clear(); // Clear buffer on error to prevent accumulation
+        });
+      }
     }
   }
+
   Future<void> _initializeGPS() async {
     try {
       LocationPermission permission = await Geolocator.checkPermission();
@@ -387,15 +424,24 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
         _gpsSpeed = speedInKMH;
       });
 
-      // Store speed data in buffer
-      if (_lastPosition != null) {
+      // Store speed data in buffer only if position is valid and buffer isn't full
+      if (_lastPosition != null && _lastValidGPSTime != null &&
+          DateTime.now().difference(_lastValidGPSTime!).inSeconds < _gpsValidityTimeout.inSeconds &&
+          _speedDataBuffer.length < _maxBufferSize) {
         _speedDataBuffer.add({
-          'latitude': _lastPosition!.latitude,
-          'longitude': _lastPosition!.longitude,
-          'speed': speedInKMH,
+          'latitude': double.parse(_lastPosition!.latitude.toStringAsFixed(6)), // Limit precision
+          'longitude': double.parse(_lastPosition!.longitude.toStringAsFixed(6)), // Limit precision
+          'speed': double.parse(speedInKMH.toStringAsFixed(2)), // Limit precision
+          'speed_obd': double.parse(_obdSpeed.toStringAsFixed(2)), // Limit precision
+          'speed_gps': double.parse(speedInKMH.toStringAsFixed(2)), // Limit precision
           'speed_source': 'GPS',
           'timestamp': DateTime.now().toIso8601String(),
         });
+
+        // Send data immediately if buffer reaches max size
+        if (_speedDataBuffer.length >= _maxBufferSize) {
+          _sendSpeedData();
+        }
       }
 
       if (_selectedSpeedSource == 'GPS') {
@@ -403,13 +449,6 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       }
     }
   }
-  void _toggleSpeedSmoothing(bool enable) {
-    _enableSpeedSmoothing = enable;
-    if (!enable) {
-      _gpsSpeedHistory.clear();
-    }
-  }
-
 // Enhanced helper function to validate distance jumps
   bool _isValidDistanceJump(double distanceKM) {
     // Reject distances greater than 1km between readings (likely GPS error)
@@ -616,14 +655,23 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
         setState(() {
           _obdSpeed = speed;
         });
-        if (_lastPosition != null) {
+        if (_lastPosition != null && _lastValidGPSTime != null &&
+            DateTime.now().difference(_lastValidGPSTime!).inSeconds < _gpsValidityTimeout.inSeconds &&
+            _speedDataBuffer.length < _maxBufferSize) {
           _speedDataBuffer.add({
-            'latitude': _lastPosition!.latitude,
-            'longitude': _lastPosition!.longitude,
-            'speed': speed,
+            'latitude': double.parse(_lastPosition!.latitude.toStringAsFixed(6)), // Limit precision
+            'longitude': double.parse(_lastPosition!.longitude.toStringAsFixed(6)), // Limit precision
+            'speed': double.parse(speed.toStringAsFixed(2)), // Limit precision
+            'speed_obd': double.parse(speed.toStringAsFixed(2)), // Limit precision
+            'speed_gps': double.parse(_gpsSpeed.toStringAsFixed(2)), // Limit precision
             'speed_source': 'OBD',
             'timestamp': DateTime.now().toIso8601String(),
           });
+
+          // Send data immediately if buffer reaches max size
+          if (_speedDataBuffer.length >= _maxBufferSize) {
+            _sendSpeedData();
+          }
         }
         if (_selectedSpeedSource == 'OBD') {
           _checkForSuddenSpeedChanges(_obdSpeed, 'OBD', _lastPosition ?? Position(
@@ -1505,7 +1553,9 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
   }
 // Add this to the parent widget's state class
 // Add this to the parent widget's state class
+  // Add this to the parent widget's state class
   List<DateTime> _collisionLogTimestamps = [];
+  Set<String> _loggedObjectKeys = {};
 
   Widget _buildCameraFrame(BuildContext context) {
     if (_controller == null || !_controller!.value.isInitialized || _controller!.value.previewSize == null) {
@@ -1540,33 +1590,38 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
         // Detect and log collision warnings for up to 3 different objects per minute
         if (_showDetections && recognitions != null && recognitions!.isNotEmpty) {
           final now = DateTime.now();
-          // Clean up timestamps older than 60 seconds
+          // Clean up timestamps and object keys older than 60 seconds
           _collisionLogTimestamps.removeWhere((t) => now.difference(t).inSeconds > 60);
+          _loggedObjectKeys.removeWhere((key) {
+            int timestampMs = int.tryParse(key.split('_')[0]) ?? 0;
+            return now.difference(DateTime.fromMillisecondsSinceEpoch(timestampMs)).inSeconds > 60;
+          });
 
           // Only log if fewer than 3 events in the last 60 seconds
           if (_collisionLogTimestamps.length < 3) {
-            // Track logged objects in this frame to ensure uniqueness
-            Set<String> loggedObjects = {};
-
             for (var rec in recognitions!) {
               double w = rec["rect"]["w"] * constraints.maxWidth;
               double distance = calculateDistance(w);
               if (distance <= 1.5) {
-                // Generate a unique key for the object (coarser rounding for stability)
+                // Generate a unique key for the object
                 double centerX = (rec["rect"]["x"] + rec["rect"]["w"] / 2) * constraints.maxWidth;
                 double centerY = (rec["rect"]["y"] + rec["rect"]["h"] / 2) * constraints.maxHeight;
-                String objectKey = '${rec["detectedClass"]}_${(centerX / 10).round() * 10}_${(centerY / 10).round() * 10}';
+                String objectKey = '${now.millisecondsSinceEpoch}_${rec["detectedClass"]}_${(centerX / 20).round() * 20}_${(centerY / 20).round() * 20}';
+                // Use trackingId if available for better object identification
+                if (rec["trackingId"] != null) {
+                  objectKey = '${now.millisecondsSinceEpoch}_${rec["trackingId"]}';
+                }
 
-                // Log only if this object hasn't been logged in this frame and limit not reached
-                if (!loggedObjects.contains(objectKey) && _collisionLogTimestamps.length < 3) {
+                // Log only if this object hasn't been logged recently
+                if (!_loggedObjectKeys.contains(objectKey)) {
                   _logEvent(
                     'collision_warning',
-                    'Object ${rec["detectedClass"]} detected within 1.5 meters',
+                    'Object ${rec["detectedClass"]} detected within 1.5 meters at (${centerX.toStringAsFixed(0)}, ${centerY.toStringAsFixed(0)})',
                     _lastPosition,
                   );
                   _collisionLogTimestamps.add(now);
-                  loggedObjects.add(objectKey);
-                  // Limit to one log per frame to prevent bursts
+                  _loggedObjectKeys.add(objectKey);
+                  // Limit to one log per frame
                   break;
                 }
               }
@@ -1586,6 +1641,7 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
                 color: Colors.black,
                 child: Center(
                   child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       Icon(Icons.videocam_off, color: Colors.white, size: 50),
                       SizedBox(height: 16),
