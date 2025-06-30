@@ -31,12 +31,11 @@ class _AdminPageState extends State<AdminPage> {
         Uri.parse('https://adas-backend.onrender.com/api/get_users'),
       );
       final data = jsonDecode(response.body);
-      print(data);
 
       if (data['success']) {
         setState(() {
           users = data['users'];
-          print(users);
+
           _isLoading = false;
         });
       } else {
@@ -682,14 +681,16 @@ class _UserDetailsPageState extends State<UserDetailsPage>
   bool _isLoading = true;
   late TabController _tabController;
   Timer? _refreshTimer; // Add this line
+  List<dynamic>? speedData; // New state variable for speed data
   MapController mapController = MapController();
   bool _isLegendVisible = true; // New state variable for legend visibility
 
   @override
+  @override
   void initState() {
     super.initState();
     _tabController = TabController(length: 3, vsync: this);
-    _fetchUserDetails(showLoading: true);
+    _fetchData(showLoading: true);
     _startAutoRefresh();
   }
 
@@ -703,31 +704,36 @@ class _UserDetailsPageState extends State<UserDetailsPage>
     _refreshTimer?.cancel();
     _refreshTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
       if (mounted) {
-        _fetchUserDetails(showLoading: false); // Don't show loading for auto-refresh
+        _fetchData(showLoading: false);
       }
     });
   }
-  Map<String, double> _calculateSpeedStats(List<dynamic> locations) {
+  Map<String, double> _calculateSpeedStats() {
+    if (speedData == null || speedData!.isEmpty) {
+      return {'maxSpeed': 0.0, 'averageSpeed': 0.0};
+    }
+
     double maxSpeed = 0.0;
     double totalSpeed = 0.0;
     int speedCount = 0;
 
-    for (var location in locations) {
-      final path = location['traveled_path'] as List<dynamic>? ?? [];
-      for (var point in path) {
-        final speed = (point['speed'] as num?)?.toDouble() ?? 0.0;
-        if (speed > maxSpeed) maxSpeed = speed;
-        if (speed > 0) {
-          totalSpeed += speed;
-          speedCount++;
-        }
+    for (var point in speedData!) {
+      final speedObd = (point['speed_obd'] as num?)?.toDouble() ?? 0.0;
+      final speedGps = (point['speed_gps'] as num?)?.toDouble() ?? 0.0;
+      final speed = speedObd != 0.0 ? speedObd : speedGps;
+      // Prioritize speed_obd, then speed_gps, else 0
+
+      if (speed > maxSpeed) maxSpeed = speed;
+      if (speed > 0) {
+        totalSpeed += speed;
+        speedCount++;
       }
     }
 
     final averageSpeed = speedCount > 0 ? totalSpeed / speedCount : 0.0;
     return {
-      'maxSpeed': maxSpeed.roundToDouble(), // Round to nearest integer
-      'averageSpeed': averageSpeed.roundToDouble(), // Round to nearest integer
+      'maxSpeed': maxSpeed.roundToDouble(),
+      'averageSpeed': averageSpeed.roundToDouble(),
     };
   }
   void _stopAutoRefresh() {
@@ -736,28 +742,39 @@ class _UserDetailsPageState extends State<UserDetailsPage>
   }
   // Replace your existing _fetchUserDetails method with this complete version:
 
-  Future<void> _fetchUserDetails({bool showLoading = true}) async {
+  Future<void> _fetchData({bool showLoading = true}) async {
     if (showLoading) setState(() => _isLoading = true);
     try {
+      // Fetch user details
       final queryParams = selectedDate != null
           ? '?user_id=${widget.userId}&date=${DateFormat('yyyy-MM-dd').format(selectedDate!)}'
           : '?user_id=${widget.userId}';
-      final response = await http.get(
+      final userResponse = await http.get(
         Uri.parse('https://adas-backend.onrender.com/api/get_user_details$queryParams'),
       );
-      final data = jsonDecode(response.body);
-      print(data);
-      if (data['success']) {
+      final userResult = jsonDecode(userResponse.body);
+
+
+      // Fetch speed data
+      final speedResponse = await http.get(
+        Uri.parse('https://adas-backend.onrender.com/api/get_speed_data$queryParams'),
+      );
+      final speedResult = jsonDecode(speedResponse.body);
+
+      if (userResult['success'] && speedResult['success']) {
         setState(() {
-          userData = data['user'];
+          userData = userResult['user'];
+          speedData = speedResult['speed_data'];
           if (showLoading) _isLoading = false;
         });
       } else {
         if (showLoading) {
-          print('Failed to fetch user details: ${data['error']}');
+          final error = userResult['success']
+              ? speedResult['error']
+              : userResult['error'];
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Failed to fetch user details: ${data['error']}'),
+              content: Text('Failed to fetch data: $error'),
               backgroundColor: Colors.red.shade600,
             ),
           );
@@ -765,10 +782,9 @@ class _UserDetailsPageState extends State<UserDetailsPage>
       }
     } catch (e) {
       if (showLoading) {
-        print('Failed to fetch user details: $e');
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Error fetching user details: $e'),
+            content: Text('Error fetching data: $e'),
             backgroundColor: Colors.red.shade600,
           ),
         );
@@ -777,7 +793,6 @@ class _UserDetailsPageState extends State<UserDetailsPage>
       if (showLoading) setState(() => _isLoading = false);
     }
   }
-
   Future<void> _selectDate(BuildContext context) async {
     final DateTime? picked = await showDatePicker(
       context: context,
@@ -789,10 +804,9 @@ class _UserDetailsPageState extends State<UserDetailsPage>
       setState(() {
         selectedDate = picked;
       });
-      _fetchUserDetails();
+      _fetchData();
     }
   }
-
   Widget _buildPerformanceTab() {
     if (userData == null) return const SizedBox();
 
@@ -1080,13 +1094,11 @@ class _UserDetailsPageState extends State<UserDetailsPage>
     );
   }
   Widget _buildMapTab() {
-    if (userData == null) return const SizedBox();
+    final locations = userData?['locations'] as List<dynamic>? ?? [];
+    final eventLogs = userData?['event_logs'] as List<dynamic>? ?? [];
+    final speedStats = _calculateSpeedStats();
 
-    final locations = userData!['locations'] as List<dynamic>? ?? [];
-    final eventLogs = userData!['event_logs'] as List<dynamic>? ?? [];
-    final speedStats = _calculateSpeedStats(locations);
-
-    if (locations.isEmpty) {
+    if (locations.isEmpty || locations.every((loc) => (loc['traveled_path'] as List<dynamic>?)?.isEmpty ?? true)) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -1123,10 +1135,10 @@ class _UserDetailsPageState extends State<UserDetailsPage>
         FlutterMap(
           mapController: mapController,
           options: MapOptions(
-            initialCenter: locations.isNotEmpty
+            initialCenter: locations.isNotEmpty && (locations[0]['traveled_path'] as List<dynamic>?)?.isNotEmpty == true
                 ? latlng.LatLng(
-              (locations[0]['start_location']['latitude'] as num).toDouble(),
-              (locations[0]['start_location']['longitude'] as num).toDouble(),
+              (locations[0]['traveled_path'][0]['latitude'] as num).toDouble(),
+              (locations[0]['traveled_path'][0]['longitude'] as num).toDouble(),
             )
                 : const latlng.LatLng(0.0, 0.0),
             initialZoom: 14.0,
@@ -1138,7 +1150,7 @@ class _UserDetailsPageState extends State<UserDetailsPage>
             ),
             PolylineLayer(
               polylines: locations.expand<Polyline>((location) {
-                final path = location['traveled_path'] as List<dynamic>;
+                final path = location['traveled_path'] as List<dynamic>? ?? [];
                 List<Polyline> segments = [];
 
                 for (int i = 0; i < path.length - 1; i++) {
@@ -1147,17 +1159,34 @@ class _UserDetailsPageState extends State<UserDetailsPage>
 
                   final lat1 = (p1['latitude'] as num).toDouble();
                   final lon1 = (p1['longitude'] as num).toDouble();
-                  final speed = (p1['speed'] as num?)?.toDouble() ?? 0.0;
+                  final lat2 = (p2['latitude'] as num).toDouble();
+                  final lon2 = (p2['longitude'] as num).toDouble();
+
+                  // Find matching speed from speedData
+                  double speed = 0.0;
+                  final matchedSpeed = speedData?.firstWhere(
+                        (speedPoint) {
+                      final sLat = (speedPoint['latitude'] as num).toDouble();
+                      final sLon = (speedPoint['longitude'] as num).toDouble();
+                      return (sLat - lat1).abs() < 0.0001 && (sLon - lon1).abs() < 0.0001;
+                    },
+                    orElse: () => null,
+                  );
+
+                  if (matchedSpeed != null) {
+                    final speedObd = (matchedSpeed['speed_obd'] as num?)?.toDouble() ?? 0.0;
+                    final speedGps = (matchedSpeed['speed_gps'] as num?)?.toDouble() ?? 0.0;
+                    speed = speedObd != 0.0 ? speedObd : speedGps;
+                  }
 
                   Color segmentColor = _getSpeedColor(speed);
 
+                  // Check for matching event
                   final matchedEvent = eventLogs.firstWhere(
                         (event) {
-                      double eLat = (event['latitude'] as num).toDouble();
-                      double eLon = (event['longitude'] as num).toDouble();
-                      return (eLat - lat1).abs() < 0.0001 &&
-                          (eLon - lon1).abs() < 0.0001 &&
-                          event['event_type'] != 'safe_driving';
+                      final eLat = (event['latitude'] as num).toDouble();
+                      final eLon = (event['longitude'] as num).toDouble();
+                      return (eLat - lat1).abs() < 0.0001 && (eLon - lon1).abs() < 0.0001 && event['event_type'] != 'safe_driving';
                     },
                     orElse: () => null,
                   );
@@ -1170,10 +1199,7 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                     Polyline(
                       points: [
                         latlng.LatLng(lat1, lon1),
-                        latlng.LatLng(
-                          (p2['latitude'] as num).toDouble(),
-                          (p2['longitude'] as num).toDouble(),
-                        ),
+                        latlng.LatLng(lat2, lon2),
                       ],
                       strokeWidth: 4.0,
                       color: segmentColor,
@@ -1186,58 +1212,72 @@ class _UserDetailsPageState extends State<UserDetailsPage>
             ),
             MarkerLayer(
               markers: [
-                if (locations.isNotEmpty)
-                  Marker(
-                    point: latlng.LatLng(
-                      (locations[0]['start_location']['latitude'] as num).toDouble(),
-                      (locations[0]['start_location']['longitude'] as num).toDouble(),
-                    ),
-                    child: Container(
-                      padding: const EdgeInsets.all(4),
-                      decoration: const BoxDecoration(
-                        color: Colors.white,
-                        shape: BoxShape.circle,
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black26,
-                            blurRadius: 4,
-                            offset: Offset(0, 2),
+                // Start and end markers for each trip
+                ...locations.expand<Marker>((location) {
+                  final startLat = (location['start_location']?['latitude'] as num?)?.toDouble() ?? 0.0;
+                  final startLon = (location['start_location']?['longitude'] as num?)?.toDouble() ?? 0.0;
+                  final endLat = (location['end_location']?['latitude'] as num?)?.toDouble() ?? 0.0;
+                  final endLon = (location['end_location']?['longitude'] as num?)?.toDouble() ?? 0.0;
+
+                  List<Marker> markers = [];
+
+                  if (startLat != 0.0 && startLon != 0.0) {
+                    markers.add(
+                      Marker(
+                        point: latlng.LatLng(startLat, startLon),
+                        child: Container(
+                          padding: const EdgeInsets.all(4),
+                          decoration: const BoxDecoration(
+                            color: Colors.white,
+                            shape: BoxShape.circle,
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black26,
+                                blurRadius: 4,
+                                offset: Offset(0, 2),
+                              ),
+                            ],
                           ),
-                        ],
-                      ),
-                      child: const Icon(
-                        Icons.play_circle_fill,
-                        color: Colors.green,
-                        size: 30,
-                      ),
-                    ),
-                  ),
-                if (locations.isNotEmpty)
-                  Marker(
-                    point: latlng.LatLng(
-                      (locations[0]['end_location']['latitude'] as num).toDouble(),
-                      (locations[0]['end_location']['longitude'] as num).toDouble(),
-                    ),
-                    child: Container(
-                      padding: const EdgeInsets.all(4),
-                      decoration: const BoxDecoration(
-                        color: Colors.white,
-                        shape: BoxShape.circle,
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black26,
-                            blurRadius: 4,
-                            offset: Offset(0, 2),
+                          child: const Icon(
+                            Icons.play_circle_fill,
+                            color: Colors.green,
+                            size: 30,
                           ),
-                        ],
+                        ),
                       ),
-                      child: const Icon(
-                        Icons.stop_circle,
-                        color: Colors.red,
-                        size: 30,
+                    );
+                  }
+
+                  if (endLat != 0.0 && endLon != 0.0 && (endLat != startLat || endLon != startLon)) {
+                    markers.add(
+                      Marker(
+                        point: latlng.LatLng(endLat, endLon),
+                        child: Container(
+                          padding: const EdgeInsets.all(4),
+                          decoration: const BoxDecoration(
+                            color: Colors.white,
+                            shape: BoxShape.circle,
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black26,
+                                blurRadius: 4,
+                                offset: Offset(0, 2),
+                              ),
+                            ],
+                          ),
+                          child: const Icon(
+                            Icons.stop_circle,
+                            color: Colors.red,
+                            size: 30,
+                          ),
+                        ),
                       ),
-                    ),
-                  ),
+                    );
+                  }
+
+                  return markers;
+                }),
+                // Event markers
                 ...eventLogs.where((event) =>
                 event['latitude'] != 0.0 &&
                     event['longitude'] != 0.0 &&
@@ -1321,14 +1361,16 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                         ),
                       ),
                       const SizedBox(height: 8),
-                      _buildLegendItem(Icons.trending_up, Colors.orange, 'Hard Acceleration'),
-                      _buildLegendItem(Icons.speed, Colors.orange, 'Speeding'),
-                      _buildLegendItem(Icons.pause_circle_filled, Colors.red, 'Hard Braking'),
-                      _buildLegendItem(Icons.warning, Colors.purple, 'Collision Warning'),
-                      _buildLegendItem(Icons.speed_outlined, Colors.amber, 'Speed Limit'),
+                      _buildLegendItem(Icons.trending_up, Colors.deepOrange, 'Hard Acceleration'),
+                      _buildLegendItem(Icons.speed, Colors.amber.shade700, 'Speeding'),
+                      _buildLegendItem(Icons.pause_circle_filled, Colors.redAccent, 'Sudden Braking'),
+                      _buildLegendItem(Icons.pause_circle_filled, Colors.pinkAccent, 'Hard Braking'),
+                      _buildLegendItem(Icons.warning, Colors.purpleAccent, 'Collision Warning'),
+                      _buildLegendItem(Icons.speed_outlined, Colors.yellow.shade800, 'Speed Limit Exceeded'),
+                      _buildLegendItem(Icons.directions, Colors.red.shade900, 'Speed > 100 km/h'),
+                      _buildLegendItem(Icons.directions, Colors.orange.shade900, 'Speed > 80 km/h'),
                       _buildLegendItem(Icons.directions, Colors.yellow.shade600, 'Speed > 50 km/h'),
-                      _buildLegendItem(Icons.directions, Colors.orange.shade600, 'Speed > 80 km/h'),
-                      _buildLegendItem(Icons.directions, Colors.red.shade600, 'Speed > 100 km/h'),
+                      _buildLegendItem(Icons.directions, Colors.blue.shade500, 'Speed ≤ 50 km/h'),
                       const SizedBox(height: 6),
                       Divider(height: 1, color: Colors.grey.shade300),
                       const SizedBox(height: 6),
@@ -1444,9 +1486,7 @@ class _UserDetailsPageState extends State<UserDetailsPage>
         ),
       ],
     );
-  }
-
-  Widget _buildLegendItem(IconData icon, Color color, String label) {
+  }  Widget _buildLegendItem(IconData icon, Color color, String label) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 2),
       child: Row(
@@ -1477,32 +1517,32 @@ class _UserDetailsPageState extends State<UserDetailsPage>
       ),
     );
   }
-
   Color _getEventColor(String eventType) {
     switch (eventType) {
       case 'sudden_acceleration':
-      case 'speeding':
-        return Colors.orange;
+        return Colors.deepOrange; // Unique orange shade
+
       case 'sudden_braking':
+        return Colors.redAccent; // Unique red shade
       case 'hard_braking':
-        return Colors.red;
+        return Colors.pinkAccent; // Distinct pink shade
       case 'collision_warning':
-        return Colors.purple;
+        return Colors.purpleAccent; // Unique purple shade
       case 'speed_limit_violation':
-        return Colors.amber;
+        return Colors.yellow.shade800; // Distinct yellow shade
       case 'safe_driving':
-        return Colors.blue.shade300; // Subtle color for safe driving (but won't be used in legend)
+        return Colors.teal.shade300; // Unique teal for safe driving
       default:
-        return Colors.blue.shade300;
+        return Colors.grey.shade600; // Unique grey for unknown events
     }
   }
+
 
   IconData _getEventIcon(String eventType) {
     switch (eventType) {
       case 'sudden_acceleration':
         return Icons.trending_up;
-      case 'speeding':
-        return Icons.speed;
+
       case 'sudden_braking':
       case 'hard_braking':
         return Icons.pause_circle_filled;
@@ -1517,18 +1557,15 @@ class _UserDetailsPageState extends State<UserDetailsPage>
     }
   }
   Color _getSpeedColor(double speed) {
-    if (speed > 100) return Colors.red.shade600; // Above 100 km/h
-    if (speed > 80) return Colors.orange.shade600; // Above 80 km/h
-    if (speed > 50) return Colors.yellow.shade600; // Above 50 km/h
-    return Colors.blue.shade300; // Default (below or equal to 50 km/h)
+    if (speed > 100) return Colors.red.shade900; // Deep red for >100 km/h
+    if (speed > 80) return Colors.orange.shade900; // Deep orange for >80 km/h
+    if (speed > 50) return Colors.yellow.shade600; // Medium yellow for >50 km/h
+    return Colors.blue.shade500; // Medium blue for ≤50 km/h
   }
-
   String _getEventTitle(String eventType) {
     switch (eventType) {
       case 'sudden_acceleration':
         return 'Hard Acceleration';
-      case 'speeding':
-        return 'Speeding';
       case 'sudden_braking':
       case 'hard_braking':
         return 'Hard Braking';

@@ -81,7 +81,8 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
   DateTime? _lastSpeedUpdate;
   final double _suddenSpeedThreshold = 15.0; // Reduced for faster detection
   final Duration _speedCheckInterval = Duration(milliseconds: 50); // Faster interval
-
+  Position? _lastBufferPosition;
+  double? _lastBufferSpeed;
   // Constants for speed calculation
   static const double _minSpeedThreshold = 0.2; // Lowered for faster response
   static const double _maxSpeedThreshold = 300.0;
@@ -424,19 +425,26 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
         _gpsSpeed = speedInKMH;
       });
 
-      // Store speed data in buffer only if position is valid and buffer isn't full
+      // Store speed data in buffer only if position is valid, buffer isn't full, coordinates are different, and speed has changed
       if (_lastPosition != null && _lastValidGPSTime != null &&
           DateTime.now().difference(_lastValidGPSTime!).inSeconds < _gpsValidityTimeout.inSeconds &&
-          _speedDataBuffer.length < _maxBufferSize) {
+          _speedDataBuffer.length < _maxBufferSize &&
+          (_lastBufferPosition == null ||
+              _lastBufferPosition!.latitude != position.latitude ||
+              _lastBufferPosition!.longitude != position.longitude) &&
+          (_lastBufferSpeed == null || (_lastBufferSpeed! - speedInKMH).abs() > 1.0)) {
+
         _speedDataBuffer.add({
           'latitude': double.parse(_lastPosition!.latitude.toStringAsFixed(6)), // Limit precision
-          'longitude': double.parse(_lastPosition!.longitude.toStringAsFixed(6)), // Limit precision
-          'speed': double.parse(speedInKMH.toStringAsFixed(2)), // Limit precision
-          'speed_obd': double.parse(_obdSpeed.toStringAsFixed(2)), // Limit precision
+          'speed_obd': 0, // Limit precision
           'speed_gps': double.parse(speedInKMH.toStringAsFixed(2)), // Limit precision
           'speed_source': 'GPS',
           'timestamp': DateTime.now().toIso8601String(),
         });
+
+        // Update last buffer position and speed for comparison
+        _lastBufferPosition = position;
+        _lastBufferSpeed = speedInKMH;
 
         // Send data immediately if buffer reaches max size
         if (_speedDataBuffer.length >= _maxBufferSize) {
@@ -449,6 +457,7 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       }
     }
   }
+
 // Enhanced helper function to validate distance jumps
   bool _isValidDistanceJump(double distanceKM) {
     // Reject distances greater than 1km between readings (likely GPS error)
@@ -657,16 +666,35 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
         });
         if (_lastPosition != null && _lastValidGPSTime != null &&
             DateTime.now().difference(_lastValidGPSTime!).inSeconds < _gpsValidityTimeout.inSeconds &&
-            _speedDataBuffer.length < _maxBufferSize) {
+            _speedDataBuffer.length < _maxBufferSize &&
+            (_lastBufferPosition == null ||
+                _lastBufferPosition!.latitude != _lastPosition!.latitude ||
+                _lastBufferPosition!.longitude != _lastPosition!.longitude) &&
+            (_lastBufferSpeed == null || (_lastBufferSpeed! - speed).abs() > 1.0)) {
+
           _speedDataBuffer.add({
             'latitude': double.parse(_lastPosition!.latitude.toStringAsFixed(6)), // Limit precision
-            'longitude': double.parse(_lastPosition!.longitude.toStringAsFixed(6)), // Limit precision
-            'speed': double.parse(speed.toStringAsFixed(2)), // Limit precision
+            'longitude': double.parse(_lastPosition!.longitude.toStringAsFixed(6)), // Limit precision// Limit precision
             'speed_obd': double.parse(speed.toStringAsFixed(2)), // Limit precision
-            'speed_gps': double.parse(_gpsSpeed.toStringAsFixed(2)), // Limit precision
+            'speed_gps': 0, // Limit precision
             'speed_source': 'OBD',
             'timestamp': DateTime.now().toIso8601String(),
           });
+
+          // Update last buffer position and speed for comparison
+          _lastBufferPosition = Position(
+            latitude: _lastPosition!.latitude,
+            longitude: _lastPosition!.longitude,
+            timestamp: DateTime.now(),
+            accuracy: 0.0,
+            altitude: 0.0,
+            heading: 0.0,
+            speed: 0.0,
+            speedAccuracy: 0.0,
+            altitudeAccuracy: 0.0,
+            headingAccuracy: 0.0,
+          );
+          _lastBufferSpeed = speed;
 
           // Send data immediately if buffer reaches max size
           if (_speedDataBuffer.length >= _maxBufferSize) {
@@ -704,7 +732,6 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       }
     };
   }
-
   void _setDefaultUserDetails() {
     if (mounted) {
       setState(() {
