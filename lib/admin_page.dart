@@ -736,10 +736,7 @@ class _UserDetailsPageState extends State<UserDetailsPage>
       'averageSpeed': averageSpeed.roundToDouble(),
     };
   }
-  void _stopAutoRefresh() {
-    _refreshTimer?.cancel();
-    _refreshTimer = null;
-  }
+
   // Replace your existing _fetchUserDetails method with this complete version:
 
   Future<void> _fetchData({bool showLoading = true}) async {
@@ -936,7 +933,7 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                 ),
               ),
               const SizedBox(width: 12),
-              Expanded(child: SizedBox.shrink()), // Empty space for layout balance
+              const Expanded(child: SizedBox.shrink()), // Empty space for layout balance
             ],
           ),
         ],
@@ -1408,9 +1405,9 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Text(
+                    const Text(
                       'Top',
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 10,
                         fontWeight: FontWeight.w500,
                         color: Colors.black54,
@@ -1424,9 +1421,9 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                         color: Colors.black87,
                       ),
                     ),
-                    Text(
+                    const Text(
                       'km/h',
-                      style: const TextStyle(
+                      style:  TextStyle(
                         fontSize: 8,
                         fontWeight: FontWeight.w400,
                         color: Colors.black54,
@@ -1454,9 +1451,9 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Text(
+                    const Text(
                       'Avg',
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 10,
                         fontWeight: FontWeight.w500,
                         color: Colors.black54,
@@ -1470,9 +1467,9 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                         color: Colors.black87,
                       ),
                     ),
-                    Text(
+                    const Text(
                       'km/h',
-                      style: const TextStyle(
+                      style:  TextStyle(
                         fontSize: 8,
                         fontWeight: FontWeight.w400,
                         color: Colors.black54,
