@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -6,7 +7,71 @@ import 'dart:convert';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart' as latlng;
 import 'package:intl/intl.dart';
+class CircularGauge extends StatelessWidget {
+  final double score;
+  final Color color;
 
+  const CircularGauge({Key? key, required this.score, required this.color}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 120,
+      height: 120,
+      child: CustomPaint(
+        painter: _CircularGaugePainter(score: score, color: color),
+        child: Center(
+          child: Text(
+            '${score.toStringAsFixed(0)}',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 24,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CircularGaugePainter extends CustomPainter {
+  final double score;
+  final Color color;
+
+  _CircularGaugePainter({required this.score, required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = size.width / 2;
+    final backgroundPaint = Paint()
+      ..color = Colors.white.withOpacity(0.3)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 10;
+    final progressPaint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 10
+      ..strokeCap = StrokeCap.round;
+
+    // Draw background circle
+    canvas.drawCircle(center, radius - 5, backgroundPaint);
+
+    // Draw progress arc
+    final sweepAngle = (score / 100) * 2 * math.pi;
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: radius - 5),
+      -math.pi / 2,
+      sweepAngle,
+      false,
+      progressPaint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
 class AdminPage extends StatefulWidget {
   const AdminPage({Key? key}) : super(key: key);
 
@@ -103,6 +168,49 @@ class _AdminPageState extends State<AdminPage> {
       }
     } catch (e) {
       _showErrorSnackBar('Error updating user: $e');
+    }
+  }
+  Future<void> _deleteUser(String userId, String userName) async {
+    // Show confirmation dialog
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete User'),
+        content: Text('Are you sure you want to delete all data for $userName? This action cannot be undone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    setState(() => _isLoading = true);
+    try {
+      final response = await http.delete(
+        Uri.parse('https://adas-backend.onrender.com/api/delete_user/$userId'),
+        headers: {'Content-Type': 'application/json'},
+      );
+
+      final result = jsonDecode(response.body);
+      if (result['success']) {
+        _showSuccessSnackBar(result['message']);
+        await _fetchUsers(); // Refresh the user list
+      } else {
+        _showErrorSnackBar('Failed to delete user: ${result['error']}');
+      }
+    } catch (e) {
+      print(e);
+      _showErrorSnackBar('Error deleting user: $e');
+    } finally {
+      setState(() => _isLoading = false);
     }
   }
   void _showAddUserDialog() {
@@ -639,13 +747,18 @@ class _AdminPageState extends State<AdminPage> {
                             },
                             tooltip: 'View Details',
                           ),
+                          IconButton(
+                            icon: const Icon(Icons.delete, color: Colors.red),
+                            onPressed: () => _deleteUser(user['_id'], user['full_name'] ?? user['username']),
+                            tooltip: 'Delete User',
+                          ),
                         ],
                       ),
                     ),
                   );
                 },
               ),
-            ),
+            )
           ],
         ),
       ),
@@ -677,7 +790,9 @@ class UserDetailsPage extends StatefulWidget {
 class _UserDetailsPageState extends State<UserDetailsPage>
     with SingleTickerProviderStateMixin {
   Map<String, dynamic>? userData;
-  DateTime? selectedDate;
+  String? selectedTripId; // Selected trip ID
+  List<dynamic> availableTrips = [];
+  DateTime? selectedDate = DateTime.now();
   bool _isLoading = true;
   late TabController _tabController;
   Timer? _refreshTimer; // Add this line
@@ -738,37 +853,93 @@ class _UserDetailsPageState extends State<UserDetailsPage>
   }
 
   // Replace your existing _fetchUserDetails method with this complete version:
-
   Future<void> _fetchData({bool showLoading = true}) async {
     if (showLoading) setState(() => _isLoading = true);
     try {
-      // Fetch user details
-      final queryParams = selectedDate != null
-          ? '?user_id=${widget.userId}&date=${DateFormat('yyyy-MM-dd').format(selectedDate!)}'
-          : '?user_id=${widget.userId}';
+      // Construct query with user_id, date, and optional trip_id
+      String queryParams = '?user_id=${widget.userId}';
+      if (selectedDate != null) {
+        queryParams += '&date=${DateFormat('yyyy-MM-dd').format(selectedDate!)}';
+      }
+      if (selectedTripId != null && selectedTripId != 'Overall') {
+        queryParams += '&trip_id=$selectedTripId';
+      }
+
+      // Fetch user details (metadata only, no locations or event_logs)
       final userResponse = await http.get(
         Uri.parse('https://adas-backend.onrender.com/api/get_user_details$queryParams'),
       );
-      final userResult = jsonDecode(userResponse.body);
+      print('User details URL: ${Uri.parse('https://adas-backend.onrender.com/api/get_user_details$queryParams')}');
+      print('User response: ${userResponse.body}');
 
+      // Fetch trip data and events
+      final tripsResponse = await http.get(
+        Uri.parse('https://adas-backend.onrender.com/api/get_trips_data$queryParams'),
+      );
+      print('Trips URL: ${Uri.parse('https://adas-backend.onrender.com/api/get_trips_data$queryParams')}');
+      print('Trips response: ${tripsResponse.body}');
 
       // Fetch speed data
       final speedResponse = await http.get(
         Uri.parse('https://adas-backend.onrender.com/api/get_speed_data$queryParams'),
       );
+      print('Speed data URL: ${Uri.parse('https://adas-backend.onrender.com/api/get_speed_data$queryParams')}');
+      print('Speed response: ${speedResponse.body}');
+
+      final userResult = jsonDecode(userResponse.body);
+      final tripsResult = jsonDecode(tripsResponse.body);
       final speedResult = jsonDecode(speedResponse.body);
 
-      if (userResult['success'] && speedResult['success']) {
+      if (userResult['success'] && tripsResult['success'] && speedResult['success']) {
         setState(() {
-          userData = userResult['user'];
-          speedData = speedResult['speed_data'];
+          // Process trips_data or trip_data
+          final trips = (selectedTripId != null && selectedTripId != 'Overall')
+              ? [tripsResult['trip_data']] // Single trip
+              : tripsResult['trips_data'] ?? []; // All trips
+
+          // Map trips to userData['locations'] and clean traveled_path
+          userData = {
+            ...userResult['user'],
+            'locations': trips.map((trip) => ({
+              'trip_id': trip['trip_id'],
+              'user_id': widget.userId,
+              'start_location': {
+                'latitude': (trip['start_location']['latitude'] as num?)?.toDouble() ?? 0.0,
+                'longitude': (trip['start_location']['longitude'] as num?)?.toDouble() ?? 0.0,
+              },
+              'end_location': {
+                'latitude': (trip['end_location']['latitude'] as num?)?.toDouble() ?? 0.0,
+                'longitude': (trip['end_location']['longitude'] as num?)?.toDouble() ?? 0.0,
+              },
+              'traveled_path': (trip['traveled_path'] as List<dynamic>?)?.map((point) => ({
+                'latitude': (point['latitude'] as num?)?.toDouble() ?? 0.0,
+                'longitude': (point['longitude'] as num?)?.toDouble() ?? 0.0,
+              })).toList() ?? [],
+              'start_time': trip['start_time'],
+              'stop_time': trip['stop_time'],
+              'timestamp': trip['timestamp'] ?? trip['start_time'],
+              'total_distance': (trip['total_distance'] as num?)?.toDouble() ?? 0.0,
+              'total_drive_time': trip['total_drive_time'],
+            })).toList(),
+            'event_logs': (selectedTripId != null && selectedTripId != 'Overall')
+                ? (tripsResult['trip_data']['events'] as List<dynamic>?) ?? []
+                : (tripsResult['trips_data'] as List<dynamic>?)?.expand((trip) => (trip['events'] as List<dynamic>?) ?? []).toList() ?? [],
+            'trip_count': tripsResult['total_trips'] ?? trips.length,
+          };
+          speedData = speedResult['speed_data'] ?? [];
+          // Update available trips when fetching all data
+          if (selectedTripId == null || selectedTripId == 'Overall') {
+            availableTrips = trips;
+          }
           if (showLoading) _isLoading = false;
         });
       } else {
         if (showLoading) {
-          final error = userResult['success']
-              ? speedResult['error']
-              : userResult['error'];
+          final error = !userResult['success']
+              ? userResult['error']
+              : !tripsResult['success']
+              ? tripsResult['error']
+              : speedResult['error'];
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text('Failed to fetch data: $error'),
@@ -778,6 +949,7 @@ class _UserDetailsPageState extends State<UserDetailsPage>
         }
       }
     } catch (e) {
+      print('Fetch data error: $e');
       if (showLoading) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -790,6 +962,7 @@ class _UserDetailsPageState extends State<UserDetailsPage>
       if (showLoading) setState(() => _isLoading = false);
     }
   }
+
   Future<void> _selectDate(BuildContext context) async {
     final DateTime? picked = await showDatePicker(
       context: context,
@@ -800,31 +973,78 @@ class _UserDetailsPageState extends State<UserDetailsPage>
     if (picked != null && picked != selectedDate) {
       setState(() {
         selectedDate = picked;
+        selectedTripId = null; // Reset trip selection on date change
       });
       _fetchData();
     }
   }
+  String _calculateDrivingTime(String? startTime, String? stopTime) {
+    if (startTime == null || stopTime == null) return 'N/A';
+    try {
+      final start = DateTime.parse(startTime);
+      final stop = DateTime.parse(stopTime);
+      final duration = stop.difference(start);
+      final hours = duration.inHours;
+      final minutes = duration.inMinutes % 60;
+      return hours > 0 ? '${hours}h ${minutes}m' : '${minutes}m';
+    } catch (e) {
+      return 'N/A';
+    }
+  }
+
   Widget _buildPerformanceTab() {
     if (userData == null) return const SizedBox();
 
     final eventLogs = userData!['event_logs'] as List<dynamic>? ?? [];
-    final totalEvents = eventLogs.length;
     final locations = userData!['locations'] as List<dynamic>? ?? [];
+    final tripCount = (userData!['trip_count'] as num?)?.toInt() ?? 0;
 
-    final suddenAcceleration = eventLogs.where((e) => e['event_type'] == 'sudden_acceleration').length;
-    final suddenBraking = eventLogs.where((e) => e['event_type'] == 'sudden_braking').length;
-    final collisionWarnings = eventLogs.where((e) => e['event_type'] == 'collision_warning').length;
+    // Filter data for selected trip if applicable
+    final filteredLocations = selectedTripId == null || selectedTripId == 'Overall'
+        ? locations
+        : locations.where((loc) => loc['trip_id'] == selectedTripId).toList();
+    final filteredEvents = selectedTripId == null || selectedTripId == 'Overall'
+        ? eventLogs
+        : eventLogs.where((e) => e['trip_id'] == selectedTripId).toList();
+
+    final totalEvents = filteredEvents.length;
+    final suddenAcceleration = filteredEvents.where((e) => e['event_type'] == 'sudden_acceleration').length;
+    final suddenBraking = filteredEvents.where((e) => e['event_type'] == 'sudden_braking').length;
+    final collisionWarnings = filteredEvents.where((e) => e['event_type'] == 'collision_warning').length;
     double totalDistance = 0.0;
-    for (var location in locations) {
+    for (var location in filteredLocations) {
       totalDistance += (location['total_distance'] as num?)?.toDouble() ?? 0.0;
     }
+
+    // Trip-specific details (for selected trip)
+    String? startTime;
+    String? stopTime;
+    String? driveTime;
+    if (filteredLocations.isNotEmpty && selectedTripId != null && selectedTripId != 'Overall') {
+      final trip = filteredLocations[0];
+      startTime = DateFormat('MMM dd, yyyy HH:mm').format(DateTime.parse(trip['start_time']));
+      stopTime = trip['stop_time'] != null
+          ? DateFormat('MMM dd, yyyy HH:mm').format(DateTime.parse(trip['stop_time']))
+          : 'Not ended';
+      driveTime = _calculateDrivingTime(trip['start_time'], trip['stop_time']);
+    }
+
+    // Score gauge color
+    final score = (userData!['score'] as num?)?.toDouble() ?? 0.0;
+    final scoreColor = score >= 80
+        ? Colors.green
+        : score >= 50
+        ? Colors.yellow.shade600
+        : score >= 30
+        ? Colors.orange
+        : Colors.red;
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Performance Score Card
+          // Performance Score Card with Circular Gauge
           Container(
             width: double.infinity,
             padding: const EdgeInsets.all(20),
@@ -835,6 +1055,13 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                 end: Alignment.bottomRight,
               ),
               borderRadius: BorderRadius.circular(16),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.1),
+                  blurRadius: 10,
+                  offset: const Offset(0, 4),
+                ),
+              ],
             ),
             child: Column(
               children: [
@@ -847,36 +1074,95 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                   ),
                 ),
                 const SizedBox(height: 12),
+                CircularGauge(score: score, color: scoreColor),
+                const SizedBox(height: 8),
                 Text(
-                  '${userData!['score'] ?? 0}',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 48,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const Text(
-                  'out of 100',
+                  score >= 80
+                      ? 'Excellent'
+                      : score >= 50
+                      ? 'Good'
+                      : score >= 30
+                      ? 'Needs Improvement'
+                      : 'Poor',
                   style: TextStyle(
                     color: Colors.white70,
-                    fontSize: 16,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
                   ),
                 ),
               ],
             ),
           ),
           const SizedBox(height: 20),
-
+          // Trip Details (for selected trip)
+          if (selectedTripId != null && selectedTripId != 'Overall' && startTime != null) ...[
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.05),
+                    blurRadius: 8,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: Colors.blue.shade50,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Icon(Icons.directions_car, color: Colors.blue.shade600, size: 24),
+                      ),
+                      const SizedBox(width: 12),
+                      Text(
+                        'Trip Details',
+                        style: TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.grey.shade800,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  _buildTripDetailRow('Trip ID', selectedTripId!, Icons.confirmation_number),
+                  const SizedBox(height: 12),
+                  _buildTripDetailRow('Start Time', startTime, Icons.play_circle_outline),
+                  const SizedBox(height: 12),
+                  _buildTripDetailRow('Stop Time', stopTime, Icons.stop_circle_outlined),
+                  const SizedBox(height: 12),
+                  _buildTripDetailRow('Driving Time', driveTime, Icons.timer),
+                  const SizedBox(height: 12),
+                  _buildTripDetailRow(
+                    'Distance',
+                    totalDistance.toStringAsFixed(1) + ' km',
+                    Icons.straighten,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 20),
+          ],
           // Event Statistics
-          const Text(
+          Text(
             'Event Statistics',
             style: TextStyle(
               fontSize: 20,
               fontWeight: FontWeight.bold,
+              color: Colors.grey.shade800,
             ),
           ),
           const SizedBox(height: 12),
-
           Row(
             children: [
               Expanded(
@@ -899,7 +1185,6 @@ class _UserDetailsPageState extends State<UserDetailsPage>
             ],
           ),
           const SizedBox(height: 12),
-
           Row(
             children: [
               Expanded(
@@ -933,16 +1218,65 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                 ),
               ),
               const SizedBox(width: 12),
-              const Expanded(child: SizedBox.shrink()), // Empty space for layout balance
+              Expanded(
+                child: _buildStatCard(
+                  'Total Trips',
+                  tripCount.toString(),
+                  Icons.directions_car,
+                  Colors.teal,
+                ),
+              ),
             ],
           ),
         ],
       ),
-
     );
-
   }
 
+// Helper method for trip detail rows
+  Widget _buildTripDetailRow(String label, String? value, IconData icon) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(6),
+          decoration: BoxDecoration(
+            color: Colors.grey.shade100,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Icon(
+            icon,
+            size: 20,
+            color: Colors.blue.shade600,
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.grey.shade700,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                value ?? 'N/A',
+                style: TextStyle(
+                  fontSize: 14,
+                  color: Colors.grey.shade600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
   Widget _buildStatCard(String title, String value, IconData icon, Color color) {
     return Container(
       padding: const EdgeInsets.all(16),
@@ -1092,10 +1426,21 @@ class _UserDetailsPageState extends State<UserDetailsPage>
   }
   Widget _buildMapTab() {
     final locations = userData?['locations'] as List<dynamic>? ?? [];
+    print('Locations in map tab: ${jsonEncode(locations)}'); // Debug
     final eventLogs = userData?['event_logs'] as List<dynamic>? ?? [];
     final speedStats = _calculateSpeedStats();
 
-    if (locations.isEmpty || locations.every((loc) => (loc['traveled_path'] as List<dynamic>?)?.isEmpty ?? true)) {
+    // Filter locations and events for selected trip
+    final filteredLocations = selectedTripId == null || selectedTripId == 'Overall'
+        ? locations
+        : locations.where((loc) => loc['trip_id'] == selectedTripId).toList();
+    print('Filtered locations: ${jsonEncode(filteredLocations)}'); // Debug
+    final filteredEvents = selectedTripId == null || selectedTripId == 'Overall'
+        ? eventLogs
+        : eventLogs.where((e) => e['trip_id'] == selectedTripId).toList();
+
+    if (filteredLocations.isEmpty || filteredLocations.every((loc) => (loc['traveled_path'] as List<dynamic>?)?.isEmpty ?? true)) {
+      print('No travel data: filteredLocations=$filteredLocations'); // Debug
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -1122,6 +1467,15 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                 ),
               ),
             ],
+            if (selectedTripId != null && selectedTripId != 'Overall') ...[
+              const SizedBox(height: 8),
+              Text(
+                'Trip: $selectedTripId',
+                style: TextStyle(
+                  color: Colors.grey.shade500,
+                ),
+              ),
+            ],
           ],
         ),
       );
@@ -1132,10 +1486,10 @@ class _UserDetailsPageState extends State<UserDetailsPage>
         FlutterMap(
           mapController: mapController,
           options: MapOptions(
-            initialCenter: locations.isNotEmpty && (locations[0]['traveled_path'] as List<dynamic>?)?.isNotEmpty == true
+            initialCenter: filteredLocations.isNotEmpty && (filteredLocations[0]['traveled_path'] as List<dynamic>?)?.isNotEmpty == true
                 ? latlng.LatLng(
-              (locations[0]['traveled_path'][0]['latitude'] as num).toDouble(),
-              (locations[0]['traveled_path'][0]['longitude'] as num).toDouble(),
+              (filteredLocations[0]['traveled_path'][0]['latitude'] as num).toDouble(),
+              (filteredLocations[0]['traveled_path'][0]['longitude'] as num).toDouble(),
             )
                 : const latlng.LatLng(0.0, 0.0),
             initialZoom: 14.0,
@@ -1146,7 +1500,7 @@ class _UserDetailsPageState extends State<UserDetailsPage>
               subdomains: const ['a', 'b', 'c'],
             ),
             PolylineLayer(
-              polylines: locations.expand<Polyline>((location) {
+              polylines: filteredLocations.expand<Polyline>((location) {
                 final path = location['traveled_path'] as List<dynamic>? ?? [];
                 List<Polyline> segments = [];
 
@@ -1179,7 +1533,7 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                   Color segmentColor = _getSpeedColor(speed);
 
                   // Check for matching event
-                  final matchedEvent = eventLogs.firstWhere(
+                  final matchedEvent = filteredEvents.firstWhere(
                         (event) {
                       final eLat = (event['latitude'] as num).toDouble();
                       final eLon = (event['longitude'] as num).toDouble();
@@ -1209,8 +1563,8 @@ class _UserDetailsPageState extends State<UserDetailsPage>
             ),
             MarkerLayer(
               markers: [
-                // Start and end markers for each trip
-                ...locations.expand<Marker>((location) {
+                // Start and end markers for filtered trips
+                ...filteredLocations.expand<Marker>((location) {
                   final startLat = (location['start_location']?['latitude'] as num?)?.toDouble() ?? 0.0;
                   final startLon = (location['start_location']?['longitude'] as num?)?.toDouble() ?? 0.0;
                   final endLat = (location['end_location']?['latitude'] as num?)?.toDouble() ?? 0.0;
@@ -1275,7 +1629,7 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                   return markers;
                 }),
                 // Event markers
-                ...eventLogs.where((event) =>
+                ...filteredEvents.where((event) =>
                 event['latitude'] != 0.0 &&
                     event['longitude'] != 0.0 &&
                     event['event_type'] != 'safe_driving' &&
@@ -1387,7 +1741,6 @@ class _UserDetailsPageState extends State<UserDetailsPage>
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
-              // Top Speed Circle
               Container(
                 width: 80,
                 height: 80,
@@ -1423,7 +1776,7 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                     ),
                     const Text(
                       'km/h',
-                      style:  TextStyle(
+                      style: TextStyle(
                         fontSize: 8,
                         fontWeight: FontWeight.w400,
                         color: Colors.black54,
@@ -1433,7 +1786,6 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                 ),
               ),
               const SizedBox(height: 8),
-              // Average Speed Circle
               Container(
                 width: 80,
                 height: 80,
@@ -1469,7 +1821,7 @@ class _UserDetailsPageState extends State<UserDetailsPage>
                     ),
                     const Text(
                       'km/h',
-                      style:  TextStyle(
+                      style: TextStyle(
                         fontSize: 8,
                         fontWeight: FontWeight.w400,
                         color: Colors.black54,
@@ -1483,7 +1835,8 @@ class _UserDetailsPageState extends State<UserDetailsPage>
         ),
       ],
     );
-  }  Widget _buildLegendItem(IconData icon, Color color, String label) {
+  }
+  Widget _buildLegendItem(IconData icon, Color color, String label) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 2),
       child: Row(
@@ -1582,10 +1935,8 @@ class _UserDetailsPageState extends State<UserDetailsPage>
     return Scaffold(
       backgroundColor: Colors.grey.shade50,
       appBar: AppBar(
-
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
-
           children: [
             Text(
               widget.userName,
@@ -1612,6 +1963,70 @@ class _UserDetailsPageState extends State<UserDetailsPage>
           onPressed: () => Navigator.pop(context),
         ),
         actions: [
+          if (selectedDate != null)
+            Container(
+              margin: const EdgeInsets.only(right: 8, top: 8, bottom: 8),
+              child: DropdownButtonHideUnderline(
+                child: DropdownButton<String>(
+                  value: selectedTripId ?? 'Overall',
+                  items: [
+                    const DropdownMenuItem(
+                      value: 'Overall',
+                      child: Text('Overall'),
+                    ),
+                    ...availableTrips.asMap().entries.map((entry) {
+                      final index = entry.key + 1;
+                      final trip = entry.value;
+                      return DropdownMenuItem(
+                        value: trip['trip_id'],
+                        child: Text('Trip $index'),
+                      );
+                    }),
+                  ],
+                  onChanged: (value) {
+                    setState(() {
+                      selectedTripId = value;
+                    });
+                    _fetchData();
+                  },
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Colors.blue.shade600,
+                  ),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  borderRadius: BorderRadius.circular(20),
+                  selectedItemBuilder: (context) {
+                    return [
+                      Text(
+                        selectedTripId == null || selectedTripId == 'Overall' ? 'Overall' : 'Trip ${availableTrips.asMap().entries.firstWhere((entry) => entry.value['trip_id'] == selectedTripId).key + 1}',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.blue.shade600,
+                        ),
+                      ),
+                      ...availableTrips.asMap().entries.map((entry) {
+                        final index = entry.key + 1;
+                        return Text(
+                          'Trip $index',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.blue.shade600,
+                          ),
+                        );
+                      }),
+                    ];
+                  },
+                  dropdownColor: Colors.white,
+                  focusColor: Colors.transparent,
+                  icon: Icon(
+                    Icons.arrow_drop_down,
+                    color: Colors.blue.shade600,
+                    size: 16,
+                  ),
+                  isDense: true,
+                ),
+              ),
+            ),
           Container(
             margin: const EdgeInsets.only(right: 16, top: 8, bottom: 8),
             child: OutlinedButton.icon(

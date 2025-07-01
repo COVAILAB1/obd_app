@@ -22,12 +22,12 @@ class OBDService {
   List<String> _liveResponses = [];
   BuildContext? _context;
 
-  // Enhanced OBD command cycling with fallbacks
+  // Enhanced OBD command cycling with fallbacks including fuel level
   final List<List<String>> _obdCommandSets = [
-    ['010D', '010C', '0111'], // Primary set
-    ['01 0D', '01 0C', '01 11'], // With spaces
-    ['010D\r', '010C\r', '0111\r'], // With carriage return
-    ['010D\r\n', '010C\r\n', '0111\r\n'], // With CRLF
+    ['010D', '010C', '0111', '012F'], // Primary set with fuel level
+    ['01 0D', '01 0C', '01 11', '01 2F'], // With spaces
+    ['010D\r', '010C\r', '0111\r', '012F\r'], // With carriage return
+    ['010D\r\n', '010C\r\n', '0111\r\n', '012F\r\n'], // With CRLF
   ];
   int _currentCommandSetIndex = 0;
   int _currentObdCommandIndex = 0;
@@ -46,6 +46,7 @@ class OBDService {
     '01 10': {'name': 'maf', 'description': 'Mass Air Flow Rate'},
     '01 42': {'name': 'control_voltage', 'description': 'Control Module Voltage'},
     '01 46': {'name': 'ambient_temp', 'description': 'Ambient Air Temperature'},
+    '01 2F': {'name': 'fuel_level', 'description': 'Fuel Tank Level Input'},
   };
 
   // Callbacks for updating UI
@@ -54,6 +55,7 @@ class OBDService {
   Function(double)? onSpeedChanged;
   Function(int)? onRpmChanged;
   Function(int)? onThrottleChanged;
+  Function(int)? onFuelLevelChanged; // New callback for fuel level
   Function(List<String>)? onLiveResponsesChanged;
   Function(bool)? onBluetoothStateChanged;
 
@@ -259,6 +261,7 @@ class OBDService {
                                   _buildDataRow('Speed', '${values['speed']?.toStringAsFixed(1) ?? '0.0'} km/h'),
                                   _buildDataRow('RPM', '${values['rpm'] ?? 0} rpm'),
                                   _buildDataRow('Throttle', '${values['throttle'] ?? 0}%'),
+                                  _buildDataRow('Fuel Level', '${values['fuel_level'] ?? 0}%'), // Added fuel level display
                                 ],
                               );
                             },
@@ -300,12 +303,14 @@ class OBDService {
       'speed': _currentSpeed,
       'rpm': _currentRpm,
       'throttle': _currentThrottle,
+      'fuel_level': _currentFuelLevel, // Added fuel level to current values
     };
   }
 
   double _currentSpeed = 0.0;
   int _currentRpm = 0;
   int _currentThrottle = 0;
+  int _currentFuelLevel = 0; // New variable for fuel level
 
   void _showErrorPopup(String error) {
     if (_context != null) {
@@ -652,6 +657,18 @@ class OBDService {
         }
         break;
 
+      case '2F': // Fuel Tank Level Input
+        if (data.length >= 2) {
+          int fuelValue = int.parse(data.substring(0, 2), radix: 16);
+          int newFuelLevel = ((fuelValue * 100) / 255).round();
+          _currentFuelLevel = newFuelLevel;
+          onFuelLevelChanged?.call(newFuelLevel);
+          _lastUpdateTimes['fuel_level'] = DateTime.now();
+          print('Updated Fuel Level: $newFuelLevel%');
+          return true;
+        }
+        break;
+
       case '05': // Engine Coolant Temperature
         if (data.length >= 2) {
           int temp = int.parse(data.substring(0, 2), radix: 16) - 40;
@@ -718,9 +735,11 @@ class OBDService {
     _currentSpeed = 0.0;
     _currentRpm = 0;
     _currentThrottle = 0;
+    _currentFuelLevel = 0; // Reset fuel level
     onSpeedChanged?.call(0.0);
     onRpmChanged?.call(0);
     onThrottleChanged?.call(0);
+    onFuelLevelChanged?.call(0); // Reset fuel level callback
   }
 
   void _setStatus(String status) {

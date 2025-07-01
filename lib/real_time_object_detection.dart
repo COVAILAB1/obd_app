@@ -11,6 +11,7 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'bounding_boxes.dart';
 import 'obd_service.dart';
+import 'package:uuid/uuid.dart';
 import 'user_page.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
@@ -36,6 +37,7 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
   double _obdSpeed = 0.0;
   int _obdRpm = 0;
   int _throttlePosition = 0;
+  int _flevel = 0;
   Map<String, dynamic>? _userDetails;
   String _userId = '';
   String _errorMessage = '';
@@ -50,7 +52,7 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
   int _activeWarningCount = 0; // Track number of active warnings
   static const double _warningVerticalSpacing = 60.0; // Vertical offset between warnings
   // Collision warning management
-
+  String _tripId = '';
   // Settings for overlays
   bool _showCamera = false;
   bool _showDetections = false;
@@ -62,7 +64,8 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
   bool _showSpeedWarnings = true;
   bool _showMap = true;
   bool _showDistanceTraveled = true;
-
+  DateTime? _startTime;
+  DateTime? _stopTime;
   // Speed source selection
   String _selectedSpeedSource = 'GPS';
 
@@ -102,7 +105,8 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
   bool _isLandscape = false;
   Orientation? _lastOrientation;
   late bool _enableSpeedSmoothing;
-
+  Timer? _locationDataSendTimer;
+  static const Duration _locationDataSendInterval = Duration(seconds: 30);
   // Draggable overlay positions
   Offset _liveDataOverlayPosition = Offset.zero;
   Offset _distanceOverlayPosition = Offset.zero;
@@ -135,9 +139,16 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
     _setupOrientationListener();
     _startGPSSpeedUpdates();
     _startSafeDrivingCheck();
+    _startLocationDataSending();
     _startSpeedDataSending();
     _startOBDStatusCheck();
     _enableSpeedSmoothing = true;
+    _tripId = Uuid().v4();
+    _startTime = DateTime.now();// Generate a new trip_id for this drive session
+    _traveledPath = []; // Reset traveled path
+    _startLocation = null; // Reset start location
+    _endLocation = null; // Reset end location
+    _totalDistanceTraveled = 0.0; // Reset total distance
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final args = ModalRoute.of(context)!.settings.arguments;
       if (args is Map<String, dynamic> && args.containsKey('userId')) {
@@ -174,7 +185,16 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       DeviceOrientation.landscapeRight,
     ]);
   }
-
+  void _startLocationDataSending() {
+    _locationDataSendTimer = Timer.periodic(_locationDataSendInterval, (timer) {
+      if (_traveledPath.isNotEmpty) {
+        _sendLocationData();
+        print('Periodic location data sent at ${DateTime.now()}');
+      } else {
+        print('No location data to send at ${DateTime.now()}');
+      }
+    });
+  }
   void _resetOverlayPositions(BoxConstraints constraints) {
     if (!mounted) return;
     setState(() {
@@ -204,7 +224,6 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
     final validSpeedData = _speedDataBuffer.where((data) =>
     data['latitude'] != null &&
         data['longitude'] != null &&
-        data['speed'] != null &&
         data['speed_obd'] != null &&
         data['speed_gps'] != null &&
         data['speed_source'] != null &&
@@ -359,40 +378,74 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
     _lastPosition = position;
     _lastPositionTime = DateTime.now();
   }
+  void _stopDrive() async {
+    setState(() {
+      _stopTime = DateTime.now(); // Set stop_time when stopping the drive
+    });
+    await _sendSpeedData();
+    await _sendLocationData();
+    print('Stop Drive: Speed and location data sent for trip_id: $_tripId, start_time: $_startTime, stop_time: $_stopTime at ${DateTime.now()}');
+    setState(() {
+      _traveledPath = []; // Reset traveled path
+      _startLocation = null; // Reset start location
+      _endLocation = null; // Reset end location
+      _totalDistanceTraveled = 0.0; // Reset total distance
+      _startTime = null; // Reset start_time
+      _stopTime = null; // Reset stop_time
+      _tripId = Uuid().v4(); // Generate new trip_id for next drive
+    });
+    print('New trip_id generated for next drive: $_tripId at ${DateTime.now()}');
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (context) => UserPage(cameras: widget.cameras),
+        settings: RouteSettings(arguments: {'userId': _userId}),
+      ),
+    );
+  }
   Future<void> _sendLocationData() async {
     if (_traveledPath.isEmpty || _startLocation == null || _endLocation == null) {
+      print('No location data to send for trip_id: $_tripId at ${DateTime.now()}');
       return;
     }
 
     try {
+      final payload = jsonEncode({
+        'user_id': _userId,
+        'trip_id': _tripId,
+        'start_location': {
+          'latitude': _startLocation!.latitude,
+          'longitude': _startLocation!.longitude,
+        },
+        'end_location': {
+          'latitude': _endLocation!.latitude,
+          'longitude': _endLocation!.longitude,
+        },
+        'traveled_path': _traveledPath
+            .map((point) => {
+          'latitude': point.latitude,
+          'longitude': point.longitude,
+        })
+            .toList(),
+        'start_time': _startTime?.toIso8601String(), // Include start_time
+        'stop_time': _stopTime?.toIso8601String(), // Include stop_time (null during periodic sends)
+        'timestamp': DateTime.now().toIso8601String(),
+        'total_distance': _totalDistanceTraveled,
+      });
+      print('Sending location data for trip_id: $_tripId, start_time: $_startTime, stop_time: $_stopTime, payload size: ${payload.length} bytes at ${DateTime.now()}');
+
       final response = await http.post(
         Uri.parse('https://adas-backend.onrender.com/api/location'),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'user_id': _userId,
-          'start_location': {
-            'latitude': _startLocation!.latitude,
-            'longitude': _startLocation!.longitude,
-          },
-          'end_location': {
-            'latitude': _endLocation!.latitude,
-            'longitude': _endLocation!.longitude,
-          },
-          'traveled_path': _traveledPath
-              .map((point) => {
-            'latitude': point.latitude,
-            'longitude': point.longitude,
-          })
-              .toList(),
-          'timestamp': DateTime.now().toIso8601String(),
-          'total_distance': _totalDistanceTraveled,
-        }),
+        body: payload,
       );
 
-      if (response.statusCode != 200) {
+      if (response.statusCode == 200) {
+        print('Location data sent successfully for trip_id: $_tripId, start_time: $_startTime at ${DateTime.now()}');
+      } else {
+        print('Failed to send location data for trip_id: $_tripId, status: ${response.statusCode} at ${DateTime.now()}');
       }
     } catch (e) {
-      print('Error sending location data: $e');
+      print('Error sending location data for trip_id: $_tripId: $e at ${DateTime.now()}');
     }
   }
   void _calculateGPSSpeed(Position position) {
@@ -428,20 +481,14 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       // Store speed data in buffer only if position is valid, buffer isn't full, coordinates are different, and speed has changed
       if (_lastPosition != null && _lastValidGPSTime != null &&
           DateTime.now().difference(_lastValidGPSTime!).inSeconds < _gpsValidityTimeout.inSeconds &&
-          _speedDataBuffer.length < _maxBufferSize &&
-          (_lastBufferPosition == null ||
-              _lastBufferPosition!.latitude != position.latitude ||
-              _lastBufferPosition!.longitude != position.longitude) &&
-          (_lastBufferSpeed == null || (_lastBufferSpeed! - speedInKMH).abs() > 1.0)) {
-
+          _speedDataBuffer.length < _maxBufferSize) {
         _speedDataBuffer.add({
           'latitude': double.parse(_lastPosition!.latitude.toStringAsFixed(6)), // Limit precision
-          'speed_obd': 0, // Limit precision
+          'longitude': double.parse(_lastPosition!.longitude.toStringAsFixed(6)), // Limit precision
+          'speed_obd': double.parse('0'), // Limit precision
           'speed_gps': double.parse(speedInKMH.toStringAsFixed(2)), // Limit precision
-          'speed_source': 'GPS',
           'timestamp': DateTime.now().toIso8601String(),
         });
-
         // Update last buffer position and speed for comparison
         _lastBufferPosition = position;
         _lastBufferSpeed = speedInKMH;
@@ -666,18 +713,12 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
         });
         if (_lastPosition != null && _lastValidGPSTime != null &&
             DateTime.now().difference(_lastValidGPSTime!).inSeconds < _gpsValidityTimeout.inSeconds &&
-            _speedDataBuffer.length < _maxBufferSize &&
-            (_lastBufferPosition == null ||
-                _lastBufferPosition!.latitude != _lastPosition!.latitude ||
-                _lastBufferPosition!.longitude != _lastPosition!.longitude) &&
-            (_lastBufferSpeed == null || (_lastBufferSpeed! - speed).abs() > 1.0)) {
-
+            _speedDataBuffer.length < _maxBufferSize) {
           _speedDataBuffer.add({
             'latitude': double.parse(_lastPosition!.latitude.toStringAsFixed(6)), // Limit precision
-            'longitude': double.parse(_lastPosition!.longitude.toStringAsFixed(6)), // Limit precision// Limit precision
+            'longitude': double.parse(_lastPosition!.longitude.toStringAsFixed(6)), // Limit precision
             'speed_obd': double.parse(speed.toStringAsFixed(2)), // Limit precision
-            'speed_gps': 0, // Limit precision
-            'speed_source': 'OBD',
+            'speed_gps': double.parse('0'), // Limit precision
             'timestamp': DateTime.now().toIso8601String(),
           });
 
@@ -728,6 +769,12 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
       if (mounted && _throttlePosition != throttle) {
         setState(() {
           _throttlePosition = throttle;
+        });
+      }
+    }; _obdService.onFuelLevelChanged = (fuelLevel) {
+      if (mounted && _flevel != fuelLevel) {
+        setState(() {
+          _flevel= fuelLevel;
         });
       }
     };
@@ -1073,12 +1120,24 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
     _obdStatusCheckTimer?.cancel();
     _safeDrivingTimer?.cancel();
     _speedDataSendTimer?.cancel();
-
+    _locationDataSendTimer?.cancel();
+    setState(() {
+      _stopTime = DateTime.now(); // Set stop_time when disposing
+    });
 
     // Send any remaining speed data before disposing
     _sendSpeedData();
     _sendLocationData();
     WakelockPlus.disable();
+    setState(() {
+      _traveledPath = []; // Reset traveled path
+      _startLocation = null; // Reset start location
+      _endLocation = null; // Reset end location
+      _totalDistanceTraveled = 0.0; // Reset total distance
+      _startTime = null; // Reset start_time
+      _stopTime = null; // Reset stop_time
+      _tripId = Uuid().v4(); // Generate new trip_id for next drive
+    });
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     if (_controller != null) {
       _controller!.stopImageStream();
@@ -1311,22 +1370,32 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
   }
   Future<void> _logEvent(String eventType, String description, [Position? position]) async {
     try {
+      final payload = jsonEncode({
+        'user_id': _userId,
+        'trip_id': _tripId, // Add trip_id to event payload
+        'event_type': eventType,
+        'event_description': description,
+        'timestamp': DateTime.now().toIso8601String(),
+        'speed_obd': _obdSpeed,
+        'speed_gps': _gpsSpeed,
+        'latitude': position?.latitude ?? 0.0,
+        'longitude': position?.longitude ?? 0.0,
+      });
+      print('Logging event for trip_id: $_tripId, type: $eventType at ${DateTime.now()}');
+
       final response = await http.post(
         Uri.parse('https://adas-backend.onrender.com/api/log_event'),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'user_id': _userId,
-          'event_type': eventType,
-          'event_description': description,
-          'timestamp': DateTime.now().toIso8601String(),
-          'speed_obd': _obdSpeed,
-          'speed_gps': _gpsSpeed,
-          'latitude': position?.latitude ?? 0.0,
-          'longitude': position?.longitude ?? 0.0,
-        }),
+        body: payload,
       );
+
+      if (response.statusCode == 200) {
+        print('Event logged successfully for trip_id: $_tripId, type: $eventType at ${DateTime.now()}');
+      } else {
+        print('Failed to log event for trip_id: $_tripId, status: ${response.statusCode} at ${DateTime.now()}');
+      }
     } catch (e) {
-      print('Failed to log event: $e');
+      print('Error logging event for trip_id: $_tripId: $e at ${DateTime.now()}');
     }
   }
 
@@ -1438,6 +1507,8 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
                   Colors.blue),
               _buildCompactCardDataTile('RPM', '$_obdRpm', Colors.orange),
               _buildCompactCardDataTile('Throttle', '$_throttlePosition%', Colors.green),
+              _buildCompactCardDataTile('Fuel level', '$_flevel%', Colors.red),
+
             ],
           ),
         ),
@@ -1716,6 +1787,16 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
                   onPressed: _showMapDialog,
                 ),
               ),
+            if (_isLandscape)
+              Positioned(
+                top: 130,
+                left: 60,
+                child: IconButton(
+                icon: Icon(Icons.stop, color: Colors.red),
+            onPressed: _stopDrive,
+            tooltip: 'Stop Drive',
+        )
+              )
           ],
         );
       },
@@ -1738,6 +1819,11 @@ class _RealTimeObjectDetectionState extends State<RealTimeObjectDetection> {
           IconButton(
             onPressed: _showSettingsDialog,
             icon: Icon(Icons.settings, color: Colors.white),
+          ),
+          IconButton(
+            onPressed: _stopDrive, // Added Stop Drive button
+            icon: Icon(Icons.stop, color: Colors.red),
+            tooltip: 'Stop Drive',
           ),
           SizedBox(width: 8),
         ],
